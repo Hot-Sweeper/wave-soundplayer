@@ -45,14 +45,15 @@ declare global {
   var __pgPool: Pool | undefined;
 }
 
-const pool = globalThis.__pgPool ?? createPool();
-
-if (process.env.NODE_ENV !== "production") {
-  globalThis.__pgPool = pool;
+function getPool(): Pool {
+  if (!globalThis.__pgPool) {
+    globalThis.__pgPool = createPool();
+  }
+  return globalThis.__pgPool;
 }
 
 async function query<T extends import("pg").QueryResultRow>(text: string, values: unknown[] = []): Promise<T[]> {
-  const result = await pool.query<T>(text, values);
+  const result = await getPool().query<T>(text, values);
   return result.rows;
 }
 
