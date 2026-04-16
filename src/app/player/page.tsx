@@ -924,6 +924,17 @@ export default function PlayerPage() {
           ctrlHitbox.style.height = r.height + "px";
         }
 
+        /* ── SYNC 2D HITBOX to 3D VISUAL WAVEFORM ── */
+        const waveVisual = document.getElementById("waveform-visual");
+        const waveHitbox = document.getElementById("waveform-hitbox");
+        if (waveVisual && waveHitbox) {
+          const r = waveVisual.getBoundingClientRect();
+          waveHitbox.style.left = r.left + "px";
+          waveHitbox.style.top = r.top + "px";
+          waveHitbox.style.width = r.width + "px";
+          waveHitbox.style.height = r.height + "px";
+        }
+
         /* ── CSS SHAKE CLASS for heavy bass hits ── */
         if (isKick && bgEl && !bgEl.classList.contains("shake-active")) {
           bgEl.classList.add("shake-active");
@@ -1281,10 +1292,12 @@ export default function PlayerPage() {
     }
   };
 
-  const seekFromClientX = useCallback((clientX: number, target: HTMLDivElement) => {
+  const seekFromClientX = useCallback((clientX: number) => {
     if (!wsRef.current || !current) return;
 
-    const rect = target.getBoundingClientRect();
+    const hitbox = document.getElementById("waveform-hitbox");
+    if (!hitbox) return;
+    const rect = hitbox.getBoundingClientRect();
     if (rect.width <= 0) return;
 
     const localX = Math.min(rect.width, Math.max(0, clientX - rect.left));
@@ -1296,18 +1309,18 @@ export default function PlayerPage() {
     if (!current || !waveReady) return;
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
-    seekFromClientX(e.clientX, e.currentTarget);
+    seekFromClientX(e.clientX);
   };
 
   const onWaveSeekPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!current || !waveReady) return;
     if (!(e.buttons & 1)) return;
-    seekFromClientX(e.clientX, e.currentTarget);
+    seekFromClientX(e.clientX);
   };
 
   const onWaveSeekPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!current || !waveReady) return;
-    seekFromClientX(e.clientX, e.currentTarget);
+    seekFromClientX(e.clientX);
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
@@ -1826,6 +1839,7 @@ export default function PlayerPage() {
             display: "flex",
             alignItems: "center",
             position: "relative",
+            pointerEvents: "none",
           }}
         >
           <div style={{ position: "relative", width: "100%", height: 250 }}>
@@ -1846,6 +1860,7 @@ export default function PlayerPage() {
             />
             {/* WaveSurfer container — normal flow so it gets real width */}
             <div
+              id="waveform-visual"
               ref={waveformRef}
               className="wavesurfer-glow"
               aria-label="Waveform — click to seek"
@@ -1856,25 +1871,6 @@ export default function PlayerPage() {
                 zIndex: 1,
                 opacity: 1.0,
                 pointerEvents: "none",
-              }}
-            />
-            <div
-              role="slider"
-              aria-label="Waveform seek"
-              aria-valuemin={0}
-              aria-valuemax={Math.max(1, Math.floor(duration || 0))}
-              aria-valuenow={Math.floor(currentTime || 0)}
-              onPointerDown={onWaveSeekPointerDown}
-              onPointerMove={onWaveSeekPointerMove}
-              onPointerUp={onWaveSeekPointerUp}
-              style={{
-                position: "absolute",
-                inset: 0,
-                zIndex: 2,
-                borderRadius: 16,
-                cursor: current && waveReady ? "pointer" : "default",
-                touchAction: "none",
-                pointerEvents: current && waveReady ? "auto" : "none",
               }}
             />
             {/* Loading overlay — sits on top until waveform is ready */}
@@ -2058,6 +2054,26 @@ export default function PlayerPage() {
 
       </div>{/* end main-player-wrap */}
     </div>{/* end player-bg */}
+
+    {/* ── WAVEFORM 2D HITBOX (tracks 3D visual position, outside all transforms) ── */}
+    <div
+      id="waveform-hitbox"
+      role="slider"
+      aria-label="Waveform seek"
+      aria-valuemin={0}
+      aria-valuemax={Math.max(1, Math.floor(duration || 0))}
+      aria-valuenow={Math.floor(currentTime || 0)}
+      onPointerDown={onWaveSeekPointerDown}
+      onPointerMove={onWaveSeekPointerMove}
+      onPointerUp={onWaveSeekPointerUp}
+      style={{
+        position: "fixed",
+        zIndex: 9998,
+        cursor: current && waveReady ? "pointer" : "default",
+        touchAction: "none",
+        pointerEvents: current && waveReady ? "auto" : "none",
+      }}
+    />
 
     {/* ── CONTROLS 2D HITBOX (tracks 3D visual position, outside all transforms) ── */}
     <div
