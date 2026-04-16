@@ -379,10 +379,8 @@ export const db = {
 
   history: {
     async findMany(filter?: ReactionType) {
-      const filterClause = filter
-        ? `AND r.type = $1`
-        : "";
-      const params = filter ? [filter] : [];
+      const hasFilter = Boolean(filter);
+      const params = hasFilter ? [filter] : [];
 
       const rows = await query<{
         id: string;
@@ -390,10 +388,11 @@ export const db = {
         artist_note: string | null;
         audio_ext: string;
         avatar_path: string | null;
-        played_at: Date;
+        played_at: Date | null;
         created_at: Date;
-        reaction_type: ReactionType | null;
-        reaction_count: string;
+        like_count: string;
+        dislike_count: string;
+        fire_count: string;
       }>(
         `
           SELECT
@@ -404,51 +403,34 @@ export const db = {
             s.avatar_path,
             s.played_at,
             s.created_at,
-            r.type AS reaction_type,
-            COUNT(r.id)::text AS reaction_count
+            COUNT(*) FILTER (WHERE r.type = 'LIKE')::text AS like_count,
+            COUNT(*) FILTER (WHERE r.type = 'DISLIKE')::text AS dislike_count,
+            COUNT(*) FILTER (WHERE r.type = 'FIRE')::text AS fire_count
           FROM submissions s
-          LEFT JOIN reactions r ON r.submission_id = s.id ${filterClause}
-          WHERE s.played_at IS NOT NULL
-          ${filter ? "AND r.id IS NOT NULL" : ""}
-          GROUP BY s.id, s.artist_name, s.artist_note, s.audio_ext, s.avatar_path, s.played_at, s.created_at, r.type
-          ORDER BY s.played_at DESC
+          LEFT JOIN reactions r ON r.submission_id = s.id
+          GROUP BY s.id, s.artist_name, s.artist_note, s.audio_ext, s.avatar_path, s.played_at, s.created_at
+          HAVING ${hasFilter
+            ? "COUNT(*) FILTER (WHERE r.type = $1) > 0"
+            : "s.played_at IS NOT NULL OR COUNT(r.id) > 0"}
+          ORDER BY COALESCE(s.played_at, s.created_at) DESC, s.created_at DESC
         `,
         params,
       );
 
-      // Group reactions per submission
-      const map = new Map<string, {
-        id: string;
-        artistName: string;
-        artistNote: string | null;
-        audioExt: string;
-        avatarPath: string | null;
-        playedAt: string;
-        createdAt: string;
-        reactions: Record<string, number>;
-      }>();
-
-      for (const row of rows) {
-        let entry = map.get(row.id);
-        if (!entry) {
-          entry = {
-            id: row.id,
-            artistName: row.artist_name,
-            artistNote: row.artist_note,
-            audioExt: row.audio_ext,
-            avatarPath: row.avatar_path,
-            playedAt: row.played_at.toISOString(),
-            createdAt: row.created_at.toISOString(),
-            reactions: {},
-          };
-          map.set(row.id, entry);
-        }
-        if (row.reaction_type) {
-          entry.reactions[row.reaction_type] = Number(row.reaction_count);
-        }
-      }
-
-      return Array.from(map.values());
+      return rows.map((row) => ({
+        id: row.id,
+        artistName: row.artist_name,
+        artistNote: row.artist_note,
+        audioExt: row.audio_ext,
+        avatarPath: row.avatar_path,
+        playedAt: row.played_at ? row.played_at.toISOString() : null,
+        createdAt: row.created_at.toISOString(),
+        reactions: {
+          LIKE: Number(row.like_count),
+          DISLIKE: Number(row.dislike_count),
+          FIRE: Number(row.fire_count),
+        },
+      }));
     },
   },
 };

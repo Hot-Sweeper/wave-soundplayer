@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ThumbsUp, ThumbsDown, Flame, ArrowLeft } from "lucide-react";
+import { ThumbsUp, ThumbsDown, Flame, ArrowLeft, Music2, ListMusic } from "lucide-react";
 import Link from "next/link";
 
 type FilterType = "ALL" | "LIKE" | "DISLIKE" | "FIRE";
@@ -12,7 +12,7 @@ interface HistoryItem {
   artistNote: string | null;
   audioExt: string;
   avatarPath: string | null;
-  playedAt: string;
+  playedAt: string | null;
   createdAt: string;
   reactions: Record<string, number>;
 }
@@ -92,7 +92,7 @@ export default function HistoryPage() {
           color: "rgba(255,255,255,0.35)",
           marginLeft: 4,
         }}>
-          {items.length} played
+          {items.length} tracks
         </span>
       </div>
 
@@ -152,11 +152,11 @@ export default function HistoryPage() {
             gap: 12,
             color: "rgba(255,255,255,0.25)",
           }}>
-            <span style={{ fontSize: 40 }}>
-              {filter === "LIKE" ? "👍" : filter === "DISLIKE" ? "👎" : filter === "FIRE" ? "🔥" : "🎵"}
+            <span style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+              {filter === "LIKE" ? <ThumbsUp size={36} /> : filter === "DISLIKE" ? <ThumbsDown size={36} /> : filter === "FIRE" ? <Flame size={36} /> : <ListMusic size={36} />}
             </span>
             <span style={{ fontSize: 14 }}>
-              {filter === "ALL" ? "No songs played yet" : `No ${filter.toLowerCase()}d songs`}
+              {filter === "ALL" ? "No tracks in history yet" : `No ${filter.toLowerCase()} tracks yet`}
             </span>
           </div>
         ) : (
@@ -197,7 +197,7 @@ export default function HistoryPage() {
                       style={{ width: "100%", height: "100%", objectFit: "cover" }}
                     />
                   ) : (
-                    "🎵"
+                    <Music2 size={18} color="rgba(255,255,255,0.55)" />
                   )}
                 </div>
 
@@ -256,7 +256,7 @@ export default function HistoryPage() {
                   minWidth: 55,
                   textAlign: "right",
                 }}>
-                  {timeAgo(item.playedAt)}
+                  {timeAgo(item.playedAt ?? item.createdAt)}
                 </div>
               </div>
             ))}
