@@ -924,11 +924,11 @@ export default function PlayerPage() {
           ctrlHitbox.style.height = r.height + "px";
         }
 
-        /* ── SYNC 2D HITBOX to 3D VISUAL WAVEFORM ── */
-        const waveVisual = document.getElementById("waveform-visual");
+        /* ── SYNC 2D HITBOX to 3D WAVEFORM CARD ── */
+        const waveCard = document.getElementById("main-player-card");
         const waveHitbox = document.getElementById("waveform-hitbox");
-        if (waveVisual && waveHitbox) {
-          const r = waveVisual.getBoundingClientRect();
+        if (waveCard && waveHitbox) {
+          const r = waveCard.getBoundingClientRect();
           waveHitbox.style.left = r.left + "px";
           waveHitbox.style.top = r.top + "px";
           waveHitbox.style.width = r.width + "px";
