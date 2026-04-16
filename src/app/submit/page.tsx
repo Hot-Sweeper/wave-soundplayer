@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useRef, useCallback } from "react";
+import { ArrowLeft } from "lucide-react";
+import Link from "next/link";
 
 type SubmitState = "idle" | "uploading" | "success" | "error";
 
@@ -13,6 +15,7 @@ export default function SubmitPage() {
   const [state, setState] = useState<SubmitState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [queuePos, setQueuePos] = useState<number | null>(null);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [audioDragging, setAudioDragging] = useState(false);
   const audioInputRef = useRef<HTMLInputElement>(null);
   const avatarInputRef = useRef<HTMLInputElement>(null);
@@ -38,6 +41,7 @@ export default function SubmitPage() {
     if (!audioFile) return;
     setState("uploading");
     setError(null);
+    setUploadProgress(0);
 
     const fd = new FormData();
     fd.append("artistName", artistName);
@@ -45,21 +49,52 @@ export default function SubmitPage() {
     fd.append("audio", audioFile);
     if (avatarFile) fd.append("avatar", avatarFile);
 
-    const res = await fetch("/api/submissions", { method: "POST", body: fd });
-    const data = await res.json() as { id?: string; queuePos?: number; error?: string };
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/submissions");
 
-    if (!res.ok) {
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable) {
+        setUploadProgress(Math.round((ev.loaded / ev.total) * 100));
+      }
+    };
+
+    xhr.onload = () => {
+      try {
+        const data = JSON.parse(xhr.responseText) as { id?: string; queuePos?: number; error?: string };
+        if (xhr.status >= 200 && xhr.status < 300) {
+          setState("success");
+          setQueuePos(data.queuePos ?? null);
+        } else {
+          setState("error");
+          setError(data.error ?? "Upload failed");
+        }
+      } catch {
+        setState("error");
+        setError("Upload failed");
+      }
+    };
+
+    xhr.onerror = () => {
       setState("error");
-      setError(data.error ?? "Upload failed");
-      return;
-    }
-    setState("success");
-    setQueuePos(data.queuePos ?? null);
+      setError("Network error — please try again");
+    };
+
+    xhr.send(fd);
   };
 
   if (state === "success") {
     return (
       <div className="submit-page">
+        <Link href="/" className="back-home" style={{
+          position: "fixed", top: 20, left: 20, zIndex: 10,
+          color: "rgba(255,255,255,0.5)", textDecoration: "none",
+          display: "flex", alignItems: "center", gap: 6,
+          fontSize: 13, fontWeight: 700, fontFamily: "var(--font-sans)",
+          transition: "color 0.15s",
+        }}
+        onMouseEnter={(e) => e.currentTarget.style.color = "#fff"}
+        onMouseLeave={(e) => e.currentTarget.style.color = "rgba(255,255,255,0.5)"}
+        ><ArrowLeft size={18} /> HOME</Link>
         <div className="submit-success">
           <div className="success-icon">
             <svg width="80" height="80" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="2.5" strokeLinejoin="round" xmlns="http://www.w3.org/2000/svg" style={{ overflow: 'visible' }}>
@@ -93,6 +128,16 @@ export default function SubmitPage() {
 
   return (
     <div className="submit-page">
+      <Link href="/" className="back-home" style={{
+        position: "fixed", top: 20, left: 20, zIndex: 10,
+        color: "rgba(255,255,255,0.5)", textDecoration: "none",
+        display: "flex", alignItems: "center", gap: 6,
+        fontSize: 13, fontWeight: 700, fontFamily: "var(--font-sans)",
+        transition: "color 0.15s",
+      }}
+      onMouseEnter={(e) => e.currentTarget.style.color = "#fff"}
+      onMouseLeave={(e) => e.currentTarget.style.color = "rgba(255,255,255,0.5)"}
+      ><ArrowLeft size={18} /> HOME</Link>
       <div className="submit-card">
         <header className="submit-header">
           <div className="logo-mark">?</div>
@@ -185,6 +230,13 @@ export default function SubmitPage() {
           >
             {state === "uploading" ? "Uploading\u2026" : "Submit track \u2192"}
           </button>
+
+          {state === "uploading" && (
+            <div className="progress-wrap">
+              <div className="progress-bar" style={{ width: `${uploadProgress}%` }} />
+              <span className="progress-text">{uploadProgress}%</span>
+            </div>
+          )}
         </form>
       </div>
 
@@ -241,6 +293,19 @@ export default function SubmitPage() {
         .btn-secondary:hover { background:#e5e5e5; }
         .btn-secondary:active { transform:scale(0.95); }
         .error-msg { background:#ff4444; color:#fff; border:2px solid #000; font-size:14px; font-family:var(--font-mono); font-weight:800; text-align:center; padding:12px; text-transform:uppercase; }
+        .progress-wrap {
+          position:relative; width:100%; height:32px; background:#e5e5e5; border:2px solid #000; overflow:hidden; margin-top:-8px;
+        }
+        .progress-bar {
+          position:absolute; top:0; left:0; height:100%;
+          background: linear-gradient(90deg, #a78bfa, #7c3aed);
+          transition: width 0.2s ease-out;
+        }
+        .progress-text {
+          position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+          font-size:13px; font-weight:900; font-family:var(--font-mono); color:#000;
+          text-transform:uppercase; letter-spacing:0.05em; z-index:1;
+        }
       `}</style>
     </div>
   );

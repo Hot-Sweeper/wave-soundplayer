@@ -11,6 +11,7 @@ import {
   SkipForward,
   PlaySquare,
   History,
+  ArrowLeft,
 } from "lucide-react";
 
 /* ─── Types ──────────────────────────────────────────────────── */
@@ -1243,6 +1244,31 @@ export default function PlayerPage() {
       }}
     >
       {/* ── THREE.JS VISUALIZER BACKGROUND ── */}
+
+      {/* Back to home */}
+      <a
+        href="/"
+        style={{
+          position: "absolute",
+          top: 20,
+          left: 20,
+          zIndex: 10,
+          color: "rgba(255,255,255,0.4)",
+          textDecoration: "none",
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          fontSize: 13,
+          fontWeight: 700,
+          fontFamily: "var(--font-sans)",
+          transition: "color 0.15s",
+        }}
+        onMouseEnter={(e) => e.currentTarget.style.color = "#fff"}
+        onMouseLeave={(e) => e.currentTarget.style.color = "rgba(255,255,255,0.4)"}
+      >
+        <ArrowLeft size={18} /> HOME
+      </a>
+
       <div
         style={{
           position: "absolute",
