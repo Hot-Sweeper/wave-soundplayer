@@ -924,15 +924,6 @@ export default function PlayerPage() {
           ctrlHitbox.style.height = r.height + "px";
         }
 
-        const waveformHitbox = document.getElementById("waveform-hitbox");
-        if (waveformRef.current && waveformHitbox) {
-          const r = waveformRef.current.getBoundingClientRect();
-          waveformHitbox.style.left = r.left + "px";
-          waveformHitbox.style.top = r.top + "px";
-          waveformHitbox.style.width = r.width + "px";
-          waveformHitbox.style.height = r.height + "px";
-        }
-
         /* ── CSS SHAKE CLASS for heavy bass hits ── */
         if (isKick && bgEl && !bgEl.classList.contains("shake-active")) {
           bgEl.classList.add("shake-active");
@@ -1290,12 +1281,10 @@ export default function PlayerPage() {
     }
   };
 
-  const seekFromClientX = useCallback((clientX: number) => {
+  const seekFromClientX = useCallback((clientX: number, target: HTMLDivElement) => {
     if (!wsRef.current || !current) return;
-    const hitbox = document.getElementById("waveform-hitbox");
-    if (!hitbox) return;
 
-    const rect = hitbox.getBoundingClientRect();
+    const rect = target.getBoundingClientRect();
     if (rect.width <= 0) return;
 
     const localX = Math.min(rect.width, Math.max(0, clientX - rect.left));
@@ -1307,18 +1296,18 @@ export default function PlayerPage() {
     if (!current || !waveReady) return;
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
-    seekFromClientX(e.clientX);
+    seekFromClientX(e.clientX, e.currentTarget);
   };
 
   const onWaveSeekPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!current || !waveReady) return;
     if (!(e.buttons & 1)) return;
-    seekFromClientX(e.clientX);
+    seekFromClientX(e.clientX, e.currentTarget);
   };
 
   const onWaveSeekPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!current || !waveReady) return;
-    seekFromClientX(e.clientX);
+    seekFromClientX(e.clientX, e.currentTarget);
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
@@ -1869,6 +1858,25 @@ export default function PlayerPage() {
                 pointerEvents: "none",
               }}
             />
+            <div
+              role="slider"
+              aria-label="Waveform seek"
+              aria-valuemin={0}
+              aria-valuemax={Math.max(1, Math.floor(duration || 0))}
+              aria-valuenow={Math.floor(currentTime || 0)}
+              onPointerDown={onWaveSeekPointerDown}
+              onPointerMove={onWaveSeekPointerMove}
+              onPointerUp={onWaveSeekPointerUp}
+              style={{
+                position: "absolute",
+                inset: 0,
+                zIndex: 2,
+                borderRadius: 16,
+                cursor: current && waveReady ? "pointer" : "default",
+                touchAction: "none",
+                pointerEvents: current && waveReady ? "auto" : "none",
+              }}
+            />
             {/* Loading overlay — sits on top until waveform is ready */}
             {!(current && waveReady) && (
               <div
@@ -2050,27 +2058,6 @@ export default function PlayerPage() {
 
       </div>{/* end main-player-wrap */}
     </div>{/* end player-bg */}
-
-    {/* ── WAVEFORM 2D HITBOX (accurate seek while 3D card is tilted) ── */}
-    <div
-      id="waveform-hitbox"
-      role="slider"
-      aria-label="Waveform seek"
-      aria-valuemin={0}
-      aria-valuemax={Math.max(1, Math.floor(duration || 0))}
-      aria-valuenow={Math.floor(currentTime || 0)}
-      onPointerDown={onWaveSeekPointerDown}
-      onPointerMove={onWaveSeekPointerMove}
-      onPointerUp={onWaveSeekPointerUp}
-      style={{
-        position: "fixed",
-        zIndex: 9000,
-        borderRadius: 16,
-        cursor: current && waveReady ? "pointer" : "default",
-        touchAction: "none",
-        pointerEvents: current && waveReady ? "auto" : "none",
-      }}
-    />
 
     {/* ── CONTROLS 2D HITBOX (tracks 3D visual position, outside all transforms) ── */}
     <div
