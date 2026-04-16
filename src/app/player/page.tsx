@@ -12,6 +12,7 @@ import {
   PlaySquare,
   History,
   ArrowLeft,
+  RotateCcw,
 } from "lucide-react";
 
 /* ─── Types ──────────────────────────────────────────────────── */
@@ -175,8 +176,15 @@ export default function PlayerPage() {
       const res = await fetch("/api/queue");
       const data: Submission[] = await res.json();
       setQueue(data);
+      setQueueCount(data.length);
+      if (data.length === 0) {
+        setActiveIdx(0);
+      } else {
+        setActiveIdx((idx) => Math.min(idx, data.length - 1));
+      }
     } catch {
       setQueue([]);
+      setQueueCount(0);
     } finally {
       setIsLoading(false);
     }
@@ -200,16 +208,20 @@ export default function PlayerPage() {
   /* ─── SSE: live queue count ─── */
   useEffect(() => {
     const es = new EventSource("/api/events/queue-count");
-    es.onmessage = (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        setQueueCount(data.queueCount || 0);
-      } catch (err) {
-        setQueueCount(Number(e.data) || 0);
-      }
+    es.onmessage = () => {
+      void fetchQueue();
     };
     return () => es.close();
-  }, []);
+  }, [fetchQueue]);
+
+  const replayQueue = useCallback(async () => {
+    try {
+      await fetch("/api/submissions/restore", { method: "POST" });
+      await fetchQueue();
+    } catch {
+      /* silent */
+    }
+  }, [fetchQueue]);
 
   const markSubmissionPlayed = useCallback(async (submissionId: string) => {
     try {
@@ -1779,9 +1791,33 @@ export default function PlayerPage() {
               </div>
             </>
           ) : (
-            <p style={{ color: "#fff", fontSize: 16, fontWeight: 700 }}>
-              {isLoading ? "LOADING..." : "NO TRACK SELECTED"}
-            </p>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <p style={{ color: "#fff", fontSize: 16, fontWeight: 700 }}>
+                {isLoading ? "LOADING..." : "NO TRACK SELECTED"}
+              </p>
+              {!isLoading && queueCount === 0 && (
+                <button
+                  onClick={replayQueue}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "8px 12px",
+                    borderRadius: 999,
+                    border: "1px solid rgba(255,255,255,0.25)",
+                    background: "rgba(255,255,255,0.1)",
+                    color: "#fff",
+                    fontSize: 12,
+                    fontWeight: 800,
+                    letterSpacing: "0.06em",
+                    textTransform: "uppercase",
+                    cursor: "pointer",
+                  }}
+                >
+                  <RotateCcw size={14} /> Replay Queue
+                </button>
+              )}
+            </div>
           )}
         </header>
 
