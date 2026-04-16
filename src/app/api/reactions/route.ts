@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { ReactionType } from "@/generated/prisma/enums";
+import type { ReactionType } from "@/lib/db";
 
 export async function POST(req: NextRequest) {
   const body = await req.json() as { submissionId?: string; type?: string };

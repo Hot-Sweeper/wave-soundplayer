@@ -10,6 +10,7 @@ import {
   SkipBack,
   SkipForward,
   PlaySquare,
+  History,
 } from "lucide-react";
 
 /* ─── Types ──────────────────────────────────────────────────── */
@@ -26,13 +27,14 @@ type Submission = {
 type ReactionType = "LIKE" | "DISLIKE" | "FIRE";
 
 /* ─── Constants ─────────────────────────────────────────────── */
-const BAR_COUNT = 64;
-const MAX_BAR_H = 7.5;
+const BAR_COUNT = 80;
+const MAX_BAR_H = 5.5;
 const ANALYSER_FFT_SIZE = 1024;
 const ANALYSER_SMOOTHING = 0.55;
 const DEFAULT_SAMPLE_RATE = 44100;
 const VISUALIZER_MIN_FREQ = 30;
 const VISUALIZER_MAX_FREQ = 16000;
+const BEAT_HISTORY_FRAMES = 43;
 
 /* ─── Frequency band helpers ────────────────────────────────── */
 function freqToBin(
@@ -95,8 +97,10 @@ function logFrequencyAt(index: number, total: number, minFreq: number, maxFreq: 
 }
 
 /* HSL color helper */
-function hsl(h: number, s: number, l: number): string {
-  return `hsl(${h % 360}, ${s}%, ${l}%)`;
+function hsl(h: number, s: number, l: number, a: number = 1): string {
+  // Round to 1 decimal place to ensure cross-browser compatibility with CSS hsl()
+  const hueStr = (h % 360).toFixed(1);
+  return `hsla(${hueStr}, ${s}%, ${l}%, ${a})`;
 }
 
 /* ─── Helpers ────────────────────────────────────────────────── */
@@ -121,23 +125,27 @@ export default function PlayerPage() {
   /* DOM refs */
   const waveformRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const composerRef = useRef<any>(null);
 
   /* Audio refs — never recreated */
   const wsRef = useRef<any>(null);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const bassAnalyserRef = useRef<AnalyserNode | null>(null);
   const fftDataRef = useRef(new Uint8Array(128));
+  const timeDataRef = useRef(new Uint8Array(ANALYSER_FFT_SIZE));
+  const bassTimeDataRef = useRef(new Uint8Array(ANALYSER_FFT_SIZE));
+  const oscCanvasRef = useRef<HTMLCanvasElement>(null);
 
   /* Beat detection state */
   const hueRef = useRef(0);
   const lastKickRef = useRef(0);
   const kickAccumRef = useRef(0);
-  const lastBassPulseRef = useRef(0);
 
   /* Three.js refs */
   const rendererRef = useRef<any>(null);
-  const barsRef = useRef<Array<{ main: any; mirror: any }>>([]);
+  const barsRef = useRef<Array<{ main: any; mirror: any; mat: any; mirrorMat: any }>>([]);
   const rafRef = useRef<number>(0);
 
   /* Stable refs for stale closure safety */
@@ -209,8 +217,56 @@ export default function PlayerPage() {
 
       const scene = new THREE.Scene();
       const camera = new THREE.PerspectiveCamera(46, w / h, 0.1, 100);
-      camera.position.set(0, 4.5, 16);
-      camera.lookAt(0, 0.5, 0);
+      camera.position.set(0, 5, 16);
+      camera.lookAt(0, 1.5, 0);
+
+      const { EffectComposer } = await import("three/examples/jsm/postprocessing/EffectComposer.js");
+      const { RenderPass } = await import("three/examples/jsm/postprocessing/RenderPass.js");
+      const { ShaderPass } = await import("three/examples/jsm/postprocessing/ShaderPass.js");
+
+      const composer = new EffectComposer(renderer);
+      composerRef.current = composer;
+      const renderPass = new RenderPass(scene, camera);
+      composer.addPass(renderPass);
+
+      const CustomLensShader = {
+        uniforms: {
+          tDiffuse: { value: null },
+          uAmount: { value: -0.25 }, // Reversed fisheye (distorts slightly outward at edges)
+          uChroma: { value: 0.01 }  // Distance of RGB split
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+        `,
+        fragmentShader: `
+          uniform sampler2D tDiffuse;
+          uniform float uAmount;
+          uniform float uChroma;
+          varying vec2 vUv;
+          void main() {
+            vec2 pos = vUv - 0.5;
+            float r2 = dot(pos, pos);
+            // Reverse fisheye projection
+            vec2 dUv = vUv + pos * r2 * uAmount;
+            
+            // Chromatic Aberration
+            vec4 cr = texture2D(tDiffuse, dUv * (1.0 + uChroma) - (uChroma * 0.5));
+            vec4 cg = texture2D(tDiffuse, dUv);
+            vec4 cb = texture2D(tDiffuse, dUv * (1.0 - uChroma) + (uChroma * 0.5));
+            
+            // Maintain visible alpha for shifted fringes
+            float alpha = max(cr.a, max(cg.a, cb.a));
+            
+            // Subtle Vignette
+            float vig = 1.0 - smoothstep(0.4, 0.8, length(pos));
+            
+            gl_FragColor = vec4(cr.r, cg.g, cb.b, alpha) * mix(0.85, 1.0, vig);
+          }
+        `
+      };
+      const lensPass = new ShaderPass(CustomLensShader);
+      composer.addPass(lensPass);
 
       /* Lights — will be color-shifted */
       const ambientLight = new THREE.AmbientLight(0x1a0a3a, 5);
@@ -231,7 +287,7 @@ export default function PlayerPage() {
       scene.add(pointLightTop);
 
       /* Background particles — starfield */
-      const PARTICLE_COUNT = 600;
+      const PARTICLE_COUNT = 1200;
       const particleGeo = new THREE.BufferGeometry();
       const pPositions = new Float32Array(PARTICLE_COUNT * 3);
       const pSizes = new Float32Array(PARTICLE_COUNT);
@@ -253,22 +309,77 @@ export default function PlayerPage() {
       const particles = new THREE.Points(particleGeo, particleMat);
       scene.add(particles);
 
-      /* Floor grid — glowing plane */
-      const floorGeo = new THREE.PlaneGeometry(40, 20, 1, 1);
-      const floorMat = new THREE.MeshBasicMaterial({
-        color: 0x6366f1,
+      /* Floor grid — custom shader for ripples + grid + scroll toward camera */
+      const floorGeo = new THREE.PlaneGeometry(60, 60, 30, 30);
+      const floorMat = new THREE.ShaderMaterial({
         transparent: true,
-        opacity: 0.05,
         side: THREE.DoubleSide,
+        depthWrite: false,
+        uniforms: {
+          u_time: { value: 0 },
+          u_color: { value: new THREE.Color(0x6366f1) },
+          u_rippleRadius: { value: 0.0 },
+          u_rippleWidth: { value: 1.5 },
+          u_rippleAlpha: { value: 0.0 },
+          u_baseOpacity: { value: 0.05 },
+          u_scroll: { value: 0.0 },
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          varying vec3 vPos;
+          uniform float u_time;
+          void main() {
+            vUv = uv;
+            vPos = position;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          varying vec2 vUv;
+          varying vec3 vPos;
+          uniform vec3 u_color;
+          uniform float u_rippleRadius;
+          uniform float u_rippleWidth;
+          uniform float u_rippleAlpha;
+          uniform float u_baseOpacity;
+          uniform float u_scroll;
+
+          void main() {
+            float dist = length(vPos.xy); 
+            
+            // Scrolling UV — grid moves toward camera (positive Y in plane space)
+            vec2 scrollUv = vUv;
+            scrollUv.y = fract(scrollUv.y + u_scroll);
+            
+            // Procedural grid lines with scroll
+            vec2 grid = abs(fract(scrollUv * 40.0 - 0.5) - 0.5) / fwidth(scrollUv * 40.0);
+            float line = min(grid.x, grid.y);
+            float gridAlpha = 1.0 - min(line, 1.0);
+            
+            // Expand ring
+            float ripple = smoothstep(u_rippleRadius - u_rippleWidth, u_rippleRadius, dist) 
+                         * smoothstep(u_rippleRadius + u_rippleWidth, u_rippleRadius, dist);
+            
+            float finalAlpha = u_baseOpacity + (gridAlpha * 0.18) + (ripple * u_rippleAlpha * 2.0);
+            vec3 finalColor = u_color + (ripple * vec3(1.0) * 0.8);
+
+            // Radial soft fade outward
+            float fade = smoothstep(30.0, 2.0, dist);
+            
+            gl_FragColor = vec4(finalColor, finalAlpha * fade);
+          }
+        `
       });
       const floor = new THREE.Mesh(floorGeo, floorMat);
       floor.rotation.x = -Math.PI / 2;
       floor.position.y = -0.1;
       scene.add(floor);
 
-      /* Bars */
-      const spacing = 0.24;
-      const totalW = (BAR_COUNT - 1) * spacing;
+      /* Bars — split into left & right towers flanking the player */
+      const spacing = 0.22;
+      const halfCount = BAR_COUNT / 2;
+      const groupW = (halfCount - 1) * spacing;
+      const gapHalf = 5.5; // distance from center to inner edge of each tower
       const barGeo = new THREE.BoxGeometry(0.15, 1, 0.15);
       const newBars: Array<{ main: any; mirror: any; mat: any; mirrorMat: any }> = [];
 
@@ -289,7 +400,14 @@ export default function PlayerPage() {
         });
 
         const main = new THREE.Mesh(barGeo, mat);
-        main.position.x = i * spacing - totalW / 2;
+        // Left tower: bars 0..halfCount-1, Right tower: bars halfCount..BAR_COUNT-1
+        if (i < halfCount) {
+          // Left group: inner edge at -gapHalf, bars extend leftward
+          main.position.x = -gapHalf - (halfCount - 1 - i) * spacing;
+        } else {
+          // Right group: inner edge at +gapHalf, bars extend rightward
+          main.position.x = gapHalf + (i - halfCount) * spacing;
+        }
         main.scale.y = 0.01;
         main.position.y = 0.005;
         scene.add(main);
@@ -312,8 +430,20 @@ export default function PlayerPage() {
         camera.aspect = nw / nh;
         camera.updateProjectionMatrix();
         renderer.setSize(nw, nh, false);
+        if (composerRef.current) {
+          composerRef.current.setSize(nw, nh);
+        }
       });
       ro.observe(canvas);
+
+      /* Mouse tracking for UI Levitation */
+      let mouseX = 0;
+      let mouseY = 0;
+      const onMouseMove = (e: MouseEvent) => {
+        mouseX = (e.clientX / window.innerWidth) * 2 - 1;
+        mouseY = -(e.clientY / window.innerHeight) * 2 + 1;
+      };
+      window.addEventListener("mousemove", onMouseMove);
 
       /* Render loop */
       let hidden = false;
@@ -326,11 +456,28 @@ export default function PlayerPage() {
       let smoothKick = 0;
       let smoothMid = 0;
       let smoothHigh = 0;
+      let ampFast = 0;
+      let ampSlow = 0;
+      let bassFast = 0;
+      let bassSlow = 0;
+      let bassRise = 0;
       let cameraShakeX = 0;
       let cameraShakeY = 0;
-      let prevSpectrum = new Uint8Array(0);
-      const kickFluxHistory: number[] = [];
-      const bassFluxHistory: number[] = [];
+      let kickArmed = true;
+
+      // Ripple state
+      let currentRippleRadius = 0;
+      let currentRippleAlpha = 0;
+
+      function calcRms(frame: Uint8Array): number {
+        if (frame.length === 0) return 0;
+        let sumSq = 0;
+        for (let i = 0; i < frame.length; i++) {
+          const centered = (frame[i] - 128) / 128;
+          sumSq += centered * centered;
+        }
+        return Math.sqrt(sumSq / frame.length);
+      }
 
       function animate(now: number) {
         rafRef.current = requestAnimationFrame(animate);
@@ -338,9 +485,32 @@ export default function PlayerPage() {
 
         const data = fftDataRef.current;
         const hasAnalyser = !!analyserRef.current;
-        if (hasAnalyser) analyserRef.current!.getByteFrequencyData(data);
+        const hasBassAnalyser = !!bassAnalyserRef.current;
+        if (hasAnalyser) {
+          analyserRef.current!.getByteFrequencyData(data);
+          if (timeDataRef.current.length !== analyserRef.current!.fftSize) {
+            timeDataRef.current = new Uint8Array(analyserRef.current!.fftSize);
+          }
+          analyserRef.current!.getByteTimeDomainData(timeDataRef.current);
+        }
+        if (hasBassAnalyser) {
+          if (bassTimeDataRef.current.length !== bassAnalyserRef.current!.fftSize) {
+            bassTimeDataRef.current = new Uint8Array(bassAnalyserRef.current!.fftSize);
+          }
+          bassAnalyserRef.current!.getByteTimeDomainData(bassTimeDataRef.current);
+        }
         const sampleRate = audioCtxRef.current?.sampleRate ?? DEFAULT_SAMPLE_RATE;
         const fftSize = analyserRef.current?.fftSize ?? ANALYSER_FFT_SIZE;
+
+        /* Full-mix RMS envelope for macro motion and particle speed. */
+        const rms = calcRms(timeDataRef.current);
+        const bassRms = calcRms(bassTimeDataRef.current);
+        ampFast += 0.28 * (rms - ampFast);
+        ampSlow += 0.07 * (rms - ampSlow);
+        const prevBassFast = bassFast;
+        bassFast += 0.34 * (bassRms - bassFast);
+        bassSlow += 0.045 * (bassRms - bassSlow);
+        bassRise = Math.max(0, bassFast - prevBassFast);
 
         /* Band energies */
         const rawSubBass = bandEnergyHz(data, sampleRate, fftSize, 20, 60);
@@ -348,13 +518,6 @@ export default function PlayerPage() {
         const rawKick = bandEnergyHz(data, sampleRate, fftSize, 45, 130);
         const rawMid = bandEnergyHz(data, sampleRate, fftSize, 130, 350);
         const rawHigh = bandEnergyHz(data, sampleRate, fftSize, 2000, 8000);
-
-        const subBassStartBin = freqToBin(20, sampleRate, fftSize, data.length - 1, "floor");
-        const subBassEndBin = freqToBin(60, sampleRate, fftSize, data.length - 1, "ceil");
-        const kickStartBin = freqToBin(45, sampleRate, fftSize, data.length - 1, "floor");
-        const kickEndBin = freqToBin(130, sampleRate, fftSize, data.length - 1, "ceil");
-        const subBassFlux = bandFlux(data, prevSpectrum, subBassStartBin, subBassEndBin);
-        const kickFlux = bandFlux(data, prevSpectrum, kickStartBin, kickEndBin);
 
         /* Smooth with different attack/release for punchiness */
         const subBassAtk = 0.55, subBassRel = 0.1;
@@ -371,39 +534,31 @@ export default function PlayerPage() {
         for (let k = 0; k < data.length; k++) totalEnergy += data[k];
         const idle = totalEnergy < 150;
 
-        /* Kick detection — threshold + cooldown */
-        kickFluxHistory.push(kickFlux);
-        bassFluxHistory.push(subBassFlux);
-        if (kickFluxHistory.length > 24) kickFluxHistory.shift();
-        if (bassFluxHistory.length > 24) bassFluxHistory.shift();
-
-        const kickFluxAvg = kickFluxHistory.reduce((sum, value) => sum + value, 0) / Math.max(1, kickFluxHistory.length);
-        const bassFluxAvg = bassFluxHistory.reduce((sum, value) => sum + value, 0) / Math.max(1, bassFluxHistory.length);
-        const kickThreshold = Math.max(0.035, kickFluxAvg * 1.6);
-        const bassThreshold = Math.max(0.025, bassFluxAvg * 1.45);
-
+        /* Kick detection — sidechain-style low-end envelope with hysteresis and cooldown. */
+        const triggerLevel = Math.max(0.028, bassSlow * 1.55 + 0.01);
+        const releaseLevel = Math.max(0.018, bassSlow * 1.12 + 0.003);
         const isKick =
-          rawKick > 0.16 &&
-          smoothKick > 0.14 &&
-          kickFlux > kickThreshold &&
-          (now - lastKickRef.current) > 180;
-        const isBassPulse =
-          rawSubBass > 0.14 &&
-          smoothSubBass > 0.12 &&
-          subBassFlux > bassThreshold &&
-          (now - lastBassPulseRef.current) > 240;
+          !idle &&
+          kickArmed &&
+          bassFast > triggerLevel &&
+          bassRise > 0.0035 &&
+          rawKick > 0.08 &&
+          ampFast > ampSlow * 1.02 &&
+          (now - lastKickRef.current) > 120;
         if (isKick) {
           lastKickRef.current = now;
-          kickAccumRef.current = Math.min(kickAccumRef.current + 0.45, 1.0);
+          kickAccumRef.current = Math.min(kickAccumRef.current + 0.35, 1.0);
+          kickArmed = false;
+          // Trigger Ripple
+          currentRippleRadius = 0;
+          currentRippleAlpha = 1.0;
+        } else if (!kickArmed && bassFast < releaseLevel) {
+          kickArmed = true;
         }
-        if (isBassPulse) {
-          lastBassPulseRef.current = now;
-          kickAccumRef.current = Math.min(kickAccumRef.current + 0.2, 1.0);
-        }
-        kickAccumRef.current *= idle ? 0.82 : 0.88;
+        kickAccumRef.current *= idle ? 0.88 : 0.92;
 
-        /* Hue rotation — faster on bass hits */
-        const hueSpeed = idle ? 0.08 : 0.4 + smoothBass * 3 + (isKick ? 25 : 0);
+        /* Hue rotation — smooth medium-speed cycle */
+        const hueSpeed = 0.2;
         hueRef.current = (hueRef.current + hueSpeed) % 360;
         const hue = hueRef.current;
 
@@ -421,7 +576,9 @@ export default function PlayerPage() {
               fftSize,
               data.length - 1,
             );
-            const val = data[binIndex] / 255;
+            // Square the value to create artificial dynamic range, preventing clipping
+            // on excessively loud/compressed songs.
+            const val = Math.pow(data[binIndex] / 255, 2.0);
             targetH = Math.max(0.04, val * MAX_BAR_H);
           }
 
@@ -430,9 +587,11 @@ export default function PlayerPage() {
           mirror.scale.y = main.scale.y * 0.38;
           mirror.position.y = -(mirror.scale.y / 2);
 
-          /* Per-bar rainbow color based on position + global hue */
+          /* Unified static color that matches EXACTLY the rest of the UI */
+          const color = new THREE.Color();
+          color.setHSL(hue / 360, 0.9, 0.6); // 90% saturation, 60% lightness
+
           if (!idle) {
-            const barHue = (hue + (i / BAR_COUNT) * 180) % 360;
             const binIndex = freqToBin(
               logFrequencyAt(i, BAR_COUNT, VISUALIZER_MIN_FREQ, VISUALIZER_MAX_FREQ),
               sampleRate,
@@ -440,43 +599,45 @@ export default function PlayerPage() {
               data.length - 1,
             );
             const intensity = data[binIndex] / 255;
-            const color = new THREE.Color();
-            color.setHSL(barHue / 360, 0.85 + intensity * 0.15, 0.45 + intensity * 0.35);
+            
             mat.color.copy(color);
             mat.emissive.copy(color);
-            mat.emissiveIntensity = 0.4 + intensity * 2.5;
+            mat.emissiveIntensity = 0.5 + intensity * 2.0; 
             mirrorMat.color.copy(color);
             mirrorMat.emissive.copy(color);
-            mirrorMat.emissiveIntensity = 0.2 + intensity * 1.2;
+            mirrorMat.emissiveIntensity = 0.2 + intensity * 1.5;
+
+            const centerDist = Math.abs((i / (BAR_COUNT - 1)) - 0.5) * 2.0; 
+            main.position.z = Math.pow(centerDist, 2) * -3.0;
+            mirror.position.z = main.position.z;
           } else {
-            const idleColor = new THREE.Color();
-            idleColor.setHSL((hue + i * 3) / 360, 0.5, 0.5);
-            mat.color.copy(idleColor);
-            mat.emissive.copy(idleColor);
-            mat.emissiveIntensity = 0.6;
+            mat.color.copy(color);
+            mat.emissive.copy(color);
+            mat.emissiveIntensity = 0.5;
+
+            const centerDist = Math.abs((i / (BAR_COUNT - 1)) - 0.5) * 2.0;
+            main.position.z += (Math.pow(centerDist, 2) * -3.0 - main.position.z) * 0.1;
+            mirror.position.z = main.position.z;
           }
         }
 
         /* ── DYNAMIC LIGHTS ── */
+        const unifiedColor = new THREE.Color();
+        unifiedColor.setHSL(hue / 360, 0.9, 0.6);
+        
         if (!idle) {
-          const lColor = new THREE.Color();
-          lColor.setHSL(hue / 360, 1, 0.5);
-          pointLightL.color.copy(lColor);
-          pointLightL.intensity = 2 + rawSubBass * 12;
+          pointLightL.color.copy(unifiedColor);
+          pointLightL.intensity = 3 + rawSubBass * 18;
 
-          const rColor = new THREE.Color();
-          rColor.setHSL(((hue + 120) % 360) / 360, 1, 0.5);
-          pointLightR.color.copy(rColor);
-          pointLightR.intensity = 2 + smoothKick * 15;
+          pointLightR.color.copy(unifiedColor);
+          pointLightR.intensity = 3 + smoothKick * 22;
 
-          const tColor = new THREE.Color();
-          tColor.setHSL(((hue + 240) % 360) / 360, 1, 0.5);
-          pointLightTop.color.copy(tColor);
-          pointLightTop.intensity = 1 + smoothHigh * 8;
+          pointLightTop.color.copy(unifiedColor);
+          pointLightTop.intensity = 2 + smoothHigh * 12;
 
-          ambientLight.intensity = 3 + rawBass * 6;
+          ambientLight.intensity = 4 + rawBass * 10;
           const ambColor = new THREE.Color();
-          ambColor.setHSL(((hue + 60) % 360) / 360, 0.6, 0.15);
+          ambColor.setHSL(hue / 360, 0.9, 0.15); // darker ambient version of exact hue
           ambientLight.color.copy(ambColor);
 
           dirLight.intensity = 2 + smoothMid * 5;
@@ -485,109 +646,227 @@ export default function PlayerPage() {
           pointLightR.intensity = 0;
           pointLightTop.intensity = 0;
           ambientLight.intensity = 5;
-          ambientLight.color.setHex(0x1a0a3a);
+          const idleAmbColor = new THREE.Color();
+          idleAmbColor.setHSL(hue / 360, 0.9, 0.1);
+          ambientLight.color.copy(idleAmbColor);
           dirLight.intensity = 2.5;
         }
 
-        /* ── FLOOR PULSE ── */
-        if (!idle) {
+        /* ── FLOOR PULSE & RIPPLE SHADER ── */
+        floorMat.uniforms.u_time.value = now * 0.001;
+        // Grid scroll toward camera — speed reacts to bass
+        const scrollSpeed = idle ? 0.0004 : 0.0008 + smoothBass * 0.003 + kickAccumRef.current * 0.002;
+        floorMat.uniforms.u_scroll.value = (floorMat.uniforms.u_scroll.value + scrollSpeed) % 1.0;
+        
+        // Progress ripple — fast expand, quick fade
+        currentRippleRadius += 1.6; 
+        currentRippleAlpha *= 0.88;
+        floorMat.uniforms.u_rippleRadius.value = currentRippleRadius;
+        floorMat.uniforms.u_rippleAlpha.value = currentRippleAlpha * kickAccumRef.current;
+        
+        {
           const fColor = new THREE.Color();
-          fColor.setHSL(hue / 360, 0.9, 0.4);
-          floorMat.color.copy(fColor);
-          floorMat.opacity = 0.04 + rawSubBass * 0.25 + (isKick ? 0.15 : 0);
-        } else {
-          floorMat.opacity = 0.05;
-          floorMat.color.setHex(0x6366f1);
+          fColor.setHSL(hue / 360, 0.9, 0.6); // identical to UI
+          floorMat.uniforms.u_color.value.copy(fColor);
+          floorMat.uniforms.u_baseOpacity.value = idle ? 0.05 : 0.04 + Math.pow(rawSubBass, 2.0) * 0.15;
         }
 
-        /* ── PARTICLES ── */
+        /* ── PARTICLES HYPERDRIVE ── */
         const pArr = particleGeo.attributes.position.array as Float32Array;
-        const particleSpeed = idle ? 0.003 : 0.01 + rawSubBass * 0.06;
+        // Normalize particle speed to stop overreacting to loud/squashed tracks
+        const particleSpeed = idle
+          ? 0.008
+          : 0.02 + Math.pow(ampSlow, 1.3) * 0.1 + Math.pow(bassFast, 1.5) * 0.25;
+        
         for (let i = 0; i < PARTICLE_COUNT; i++) {
           pArr[i * 3 + 2] += particleSpeed;
-          if (pArr[i * 3 + 2] > 5) {
-            pArr[i * 3 + 2] = -35;
+          
+          // Slight radial drift
+          const xDrift = pArr[i * 3] > 0 ? particleSpeed * 0.2 : -particleSpeed * 0.2;
+          const yDrift = pArr[i * 3 + 1] > 0 ? particleSpeed * 0.15 : -particleSpeed * 0.15;
+          pArr[i * 3] += xDrift;
+          pArr[i * 3 + 1] += yDrift;
+
+          if (pArr[i * 3 + 2] > 10) {
+            pArr[i * 3 + 2] = -40 - Math.random() * 20;
             pArr[i * 3] = (Math.random() - 0.5) * 60;
             pArr[i * 3 + 1] = (Math.random() - 0.5) * 40;
           }
         }
         particleGeo.attributes.position.needsUpdate = true;
-        particleMat.opacity = idle ? 0.3 : 0.4 + rawBass * 0.6;
+        particleMat.opacity = idle ? 0.3 : 0.4 + Math.min(0.6, ampFast * 1.5);
         if (!idle) {
           const pColor = new THREE.Color();
-          pColor.setHSL(((hue + 90) % 360) / 360, 0.7, 0.7);
+          pColor.setHSL(hue / 360, 0.7, 0.7); // keep particles cohesive with main hue
           particleMat.color.copy(pColor);
         }
-        particleMat.size = idle ? 0.08 : 0.08 + smoothKick * 0.15;
+        particleMat.size = idle ? 0.07 : 0.08 + ampFast * 0.5 + kickAccumRef.current * 0.15;
 
-        /* ── CAMERA SHAKE on bass/kick ── */
+        /* ── CAMERA SHAKE ── */
         if (!idle) {
-          const shakeIntensity = kickAccumRef.current * 0.18 + (isBassPulse ? 0.04 : 0);
+          const normalizedKick = Math.pow(kickAccumRef.current, 1.2);
+          const shakeIntensity = normalizedKick * 0.18 + smoothBass * 0.06;
           const targetShakeX = (Math.random() - 0.5) * shakeIntensity;
-          const targetShakeY = (Math.random() - 0.5) * shakeIntensity * 0.6;
-          cameraShakeX += (targetShakeX - cameraShakeX) * 0.4;
-          cameraShakeY += (targetShakeY - cameraShakeY) * 0.4;
+          const targetShakeY = (Math.random() - 0.5) * shakeIntensity * 0.7;
+          cameraShakeX += (targetShakeX - cameraShakeX) * 0.35;
+          cameraShakeY += (targetShakeY - cameraShakeY) * 0.35;
+          
           camera.position.x = cameraShakeX;
-          camera.position.y = 4.5 + cameraShakeY;
+          camera.position.y = 5 + cameraShakeY + Math.pow(smoothKick, 1.5) * 1.8; 
+          camera.position.z = 16 - kickAccumRef.current * 1.5;
+          camera.lookAt(cameraShakeX * 0.3, 1.5, 0);
         } else {
-          cameraShakeX *= 0.9;
-          cameraShakeY *= 0.9;
+          cameraShakeX *= 0.85;
+          cameraShakeY *= 0.85;
           camera.position.x = cameraShakeX;
-          camera.position.y = 4.5 + cameraShakeY;
+          camera.position.y = 5 + cameraShakeY;
+          camera.position.z = 16;
+          camera.lookAt(0, 1.5, 0);
         }
 
         /* ── BODY BACKGROUND COLOR ── */
         const bgEl = document.getElementById("player-bg");
         if (bgEl) {
           if (!idle) {
-            const bgLightness = 2 + smoothBass * 8;
-            const bgSat = 40 + smoothKick * 50;
-            bgEl.style.background = `radial-gradient(ellipse at center, ${hsl(hue, bgSat, bgLightness)}, ${hsl(hue + 180, bgSat * 0.5, bgLightness * 0.3)})`;
+            bgEl.style.background = `radial-gradient(ellipse at center, ${hsl(hue, 90, 15)}, ${hsl(hue, 90, 5)})`;
           } else {
-            bgEl.style.background = "#000";
+            bgEl.style.background = `radial-gradient(ellipse at center, ${hsl(hue, 90, 15)}, ${hsl(hue, 90, 5)})`;
+          }
+          // Set CSS variable for seamless sync with React UI elements
+          bgEl.style.setProperty('--theme-color', hsl(hue, 90, 65));
+          bgEl.style.setProperty('--theme-color-dim', hsl(hue, 90, 65, 0.4));
+        }
+
+        /* ── VIDEO PARTICLE OVERLAY HUE SYNC ── */
+        const particleOverlay = document.getElementById("particle-overlay");
+        if (particleOverlay) {
+          // Source video is red, so offset hue to match current theme
+          const hueShift = hue % 360;
+          const brightness = idle ? 0.6 : 0.8 + kickAccumRef.current * 0.4;
+          particleOverlay.style.filter = `hue-rotate(${hueShift}deg) saturate(1.4) brightness(${brightness})`;
+          particleOverlay.style.opacity = String(idle ? 0.25 : 0.35 + ampFast * 0.3);
+          // Playback speed reacts to energy — 1x when idle, scales with amplitude
+          const vid = particleOverlay.querySelector("video");
+          if (vid) {
+            const targetRate = idle ? 1 : Math.max(1, 1 + ampFast * 2.5 + kickAccumRef.current * 1.5);
+            vid.playbackRate = Math.min(targetRate, 4);
           }
         }
 
-        /* ── CARD SHAKE + SCALE on kick/bass ── */
-        const mainCard = document.getElementById("main-player-card");
-        if (mainCard) {
-          if (!idle) {
-            const beatScale = 1 + kickAccumRef.current * 0.08;
-            const cardShakeX = kickAccumRef.current > 0.06
-              ? (Math.random() - 0.5) * kickAccumRef.current * 6
-              : 0;
-            const cardShakeY = kickAccumRef.current > 0.06
-              ? (Math.random() - 0.5) * kickAccumRef.current * 3
-              : 0;
-            mainCard.style.transform = `scale(${beatScale}) translate(${cardShakeX}px, ${cardShakeY}px)`;
-
-            /* Glow shadow color synced to hue */
-            const shadowColor = hsl(hue, 80, 50);
-            const glowSize = 16 + rawBass * 24;
-            mainCard.style.boxShadow = `${glowSize}px ${glowSize}px 0 ${shadowColor}`;
-          } else {
-            mainCard.style.transform = "scale(1)";
-            mainCard.style.boxShadow = "16px 16px 0 #a78bfa";
+        /* ── DOM LEVITATING CARD SHAKE + SCALE ── */
+        const mainWrapEl = document.getElementById("main-card-area");
+        if (mainWrapEl) {
+          const mainWrap = mainWrapEl as any;
+          // Calculate 3D levitation tilt from mouse position
+          const targetTiltX = mouseY * 15; // deg
+          const targetTiltY = mouseX * 15; // deg
+          
+          if (!mainWrap._currentTiltX) {
+            mainWrap._currentTiltX = 0;
+            mainWrap._currentTiltY = 0;
+            mainWrap._currentScale = 1;
+            mainWrap._currentTx = 0;
+            mainWrap._currentTy = 0;
           }
+          
+          mainWrap._currentTiltX += (targetTiltX - mainWrap._currentTiltX) * 0.1;
+          mainWrap._currentTiltY += (targetTiltY - mainWrap._currentTiltY) * 0.1;
+          
+          if (!idle) {
+            const beatScaleTarget = 1 + kickAccumRef.current * 0.08 + smoothBass * 0.06;
+            const targetShakeX = kickAccumRef.current > 0.03
+              ? (Math.random() - 0.5) * kickAccumRef.current * 8
+              : 0;
+            const targetShakeY = kickAccumRef.current > 0.03
+              ? (Math.random() - 0.5) * kickAccumRef.current * 4
+              : 0;
+              
+            mainWrap._currentScale += (beatScaleTarget - mainWrap._currentScale) * 0.15;
+            mainWrap._currentTx += (targetShakeX - mainWrap._currentTx) * 0.2;
+            mainWrap._currentTy += (targetShakeY - mainWrap._currentTy) * 0.2;
+            
+            // Perspective transform + shake + scale
+            mainWrap.style.transformStyle = "preserve-3d";
+            mainWrap.style.transform = `perspective(1200px) rotateX(${mainWrap._currentTiltX}deg) rotateY(${mainWrap._currentTiltY}deg) scale(${mainWrap._currentScale}) translate(${mainWrap._currentTx}px, ${mainWrap._currentTy}px) translateZ(30px)`;
+          } else {
+            mainWrap._currentScale += (1 - mainWrap._currentScale) * 0.1;
+            mainWrap._currentTx *= 0.8;
+            mainWrap._currentTy *= 0.8;
+            
+            mainWrap.style.transformStyle = "preserve-3d";
+            mainWrap.style.transform = `perspective(1200px) rotateX(${mainWrap._currentTiltX}deg) rotateY(${mainWrap._currentTiltY}deg) scale(${mainWrap._currentScale}) translate(${mainWrap._currentTx}px, ${mainWrap._currentTy}px) translateZ(10px)`;
+          }
+        }
+
+        /* ── SYNC 2D HITBOX to 3D VISUAL CONTROLS ── */
+        const ctrlVisual = document.getElementById("controls-visual");
+        const ctrlHitbox = document.getElementById("controls-hitbox");
+        if (ctrlVisual && ctrlHitbox) {
+          const r = ctrlVisual.getBoundingClientRect();
+          ctrlHitbox.style.left = r.left + "px";
+          ctrlHitbox.style.top = r.top + "px";
+          ctrlHitbox.style.width = r.width + "px";
+          ctrlHitbox.style.height = r.height + "px";
         }
 
         /* ── CSS SHAKE CLASS for heavy bass hits ── */
-        if ((isKick || isBassPulse) && !document.body.classList.contains("shake-active")) {
-          document.body.classList.add("shake-active");
-          setTimeout(() => document.body.classList.remove("shake-active"), 150);
+        if (isKick && bgEl && !bgEl.classList.contains("shake-active")) {
+          bgEl.classList.add("shake-active");
+          setTimeout(() => bgEl.classList.remove("shake-active"), 120);
         }
 
         /* ── BORDER COLOR on card ── */
-        if (mainCard && !idle) {
-          const borderColor = hsl((hue + 90) % 360, 90, 55);
-          mainCard.style.borderColor = borderColor;
-        } else if (mainCard) {
-          mainCard.style.borderColor = "#000";
+        if (mainWrapEl) {
+          mainWrapEl.style.borderColor = "transparent";
         }
 
-        prevSpectrum = Uint8Array.from(data);
+        /* ── OSCILLOSCOPE ── */
+        if (oscCanvasRef.current && hasAnalyser) {
+          const oscCtx = oscCanvasRef.current.getContext("2d");
+          if (oscCtx) {
+            const w = oscCanvasRef.current.width;
+            const h = oscCanvasRef.current.height;
+            oscCtx.clearRect(0, 0, w, h);
+            oscCtx.lineWidth = 3;
+            oscCtx.strokeStyle = hsl(hue, 90, 65);
+            oscCtx.beginPath();
+            
+            const sliceWidth = w * 1.0 / timeDataRef.current.length;
+            let x = 0;
+            
+            for (let i = 0; i < timeDataRef.current.length; i++) {
+              const v = timeDataRef.current[i] / 128.0;
+              const y = v * h / 2;
+              
+              if (i === 0) {
+                oscCtx.moveTo(x, y);
+              } else {
+                oscCtx.lineTo(x, y);
+              }
+              x += sliceWidth;
+            }
+            oscCtx.stroke();
+          }
+        }
 
-        renderer.render(scene, camera);
+        /* ── SYNC WAVESURFER COLOR (rarely) ── */
+        if ((window as any).__ws) {
+          const wsObj = (window as any).__ws;
+          if (!wsObj._lastHue || Math.abs(wsObj._lastHue - hue) > 2) {
+            wsObj._lastHue = hue;
+            wsObj.setOptions({
+              waveColor: "rgba(255, 255, 255, 0.12)",
+              progressColor: hsl(hue, 100, 72), // Brighter for neon glow
+              cursorColor: hsl(hue, 100, 85)
+            });
+          }
+        }
+
+        if (composerRef.current) {
+          composerRef.current.render();
+        } else {
+          renderer.render(scene, camera);
+        }
       }
       rafRef.current = requestAnimationFrame(animate);
 
@@ -608,6 +887,26 @@ export default function PlayerPage() {
     return () => cleanupFn?.();
   }, []);
 
+  /* Keep viewport locked while player is open so shake transforms never add scrollbars. */
+  useEffect(() => {
+    const prevHtmlOverflow = document.documentElement.style.overflow;
+    const prevBodyOverflow = document.body.style.overflow;
+    const prevHtmlOverscroll = document.documentElement.style.overscrollBehavior;
+    const prevBodyOverscroll = document.body.style.overscrollBehavior;
+
+    document.documentElement.style.overflow = "hidden";
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overscrollBehavior = "none";
+    document.body.style.overscrollBehavior = "none";
+
+    return () => {
+      document.documentElement.style.overflow = prevHtmlOverflow;
+      document.body.style.overflow = prevBodyOverflow;
+      document.documentElement.style.overscrollBehavior = prevHtmlOverscroll;
+      document.body.style.overscrollBehavior = prevBodyOverscroll;
+    };
+  }, []);
+
   /* ─── WaveSurfer: init once on mount ─── */
   useEffect(() => {
     if (!waveformRef.current) return;
@@ -619,18 +918,19 @@ export default function PlayerPage() {
 
       const ws = WaveSurfer.create({
         container: waveformRef.current!,
-        height: 72,
-        waveColor: "rgba(124, 58, 237, 0.35)",
-        progressColor: "rgba(167, 139, 250, 0.88)",
-        cursorColor: "#f59e0b",
-        cursorWidth: 2,
-        barWidth: 2,
-        barGap: 1,
-        barRadius: 4,
+        height: 250, // Massive waveform
+        waveColor: "rgba(255, 255, 255, 0.10)", // Dim base — contrast with glowing progress
+        progressColor: "#ffffff", // Overridden instantly in render loop
+        cursorColor: "#ffffff",
+        cursorWidth: 3,
+        barWidth: 4,
+        barGap: 3,
+        barRadius: 6,
         normalize: true,
         interact: true,
         dragToSeek: true,
       });
+      (window as any).__ws = ws;
       console.log("[WS] instance created");
 
       ws.on("ready", () => {
@@ -641,6 +941,15 @@ export default function PlayerPage() {
 
       ws.on("error", (err: unknown) => {
         console.error("[WS] ERROR:", err);
+        setWaveReady(false);
+        const q = queueRef.current;
+        const nextIdx = activeIdxRef.current + 1;
+        if (nextIdx < q.length) {
+          setActiveIdx(nextIdx);
+          setReactedWith(null);
+        } else {
+          setIsPlaying(false);
+        }
       });
 
       ws.on("loading", (pct: number) => {
@@ -714,13 +1023,28 @@ export default function PlayerPage() {
       const ctx = new AudioContext();
       const source = ctx.createMediaElementSource(audioElRef.current);
       const analyser = ctx.createAnalyser();
+      const bassFilter = ctx.createBiquadFilter();
+      const bassAnalyser = ctx.createAnalyser();
+
       analyser.fftSize = ANALYSER_FFT_SIZE;
       analyser.smoothingTimeConstant = ANALYSER_SMOOTHING;
+      bassFilter.type = "lowpass";
+      bassFilter.frequency.value = 150;
+      bassFilter.Q.value = 0.9;
+      bassAnalyser.fftSize = ANALYSER_FFT_SIZE;
+      bassAnalyser.smoothingTimeConstant = 0.55;
+
       source.connect(analyser);
       analyser.connect(ctx.destination);
+      source.connect(bassFilter);
+      bassFilter.connect(bassAnalyser);
+
       audioCtxRef.current = ctx;
       analyserRef.current = analyser;
+      bassAnalyserRef.current = bassAnalyser;
       fftDataRef.current = new Uint8Array(analyser.frequencyBinCount);
+      timeDataRef.current = new Uint8Array(analyser.fftSize);
+      bassTimeDataRef.current = new Uint8Array(bassAnalyser.fftSize);
     }
 
     audioCtxRef.current?.resume();
@@ -785,28 +1109,137 @@ export default function PlayerPage() {
           80% { transform: translate(4px, 2px) rotate(0.5deg); }
           90% { transform: translate(-2px, -2px) rotate(-0.3deg); }
         }
-        .shake-active #player-bg {
+        #player-bg.shake-active {
           animation: shake 0.15s ease-in-out;
+        }
+
+        /* ── Rain ── */
+        @keyframes rain-fall {
+          0% { transform: translateY(-100vh) translateX(0); opacity: 0; }
+          10% { opacity: 1; }
+          90% { opacity: 1; }
+          100% { transform: translateY(100vh) translateX(-30px); opacity: 0; }
+        }
+        .rain-layer {
+          position: absolute;
+          inset: 0;
+          pointer-events: none;
+          overflow: hidden;
+          z-index: 0;
+        }
+        .rain-drop {
+          position: absolute;
+          top: -10px;
+          width: 1px;
+          background: linear-gradient(to bottom, transparent, rgba(180,200,255,0.4), transparent);
+          animation: rain-fall linear infinite;
+        }
+
+        /* ── Clouds ── */
+        @keyframes cloud-drift {
+          0% { transform: translateX(-20%); }
+          100% { transform: translateX(20%); }
+        }
+        .cloud-layer {
+          position: absolute;
+          top: 0;
+          left: -20%;
+          width: 140%;
+          height: 45%;
+          pointer-events: none;
+          z-index: 0;
+          opacity: 0.3;
+          background:
+            radial-gradient(ellipse 600px 120px at 15% 30%, rgba(100,100,140,0.5), transparent),
+            radial-gradient(ellipse 500px 100px at 45% 20%, rgba(80,80,130,0.4), transparent),
+            radial-gradient(ellipse 700px 130px at 70% 35%, rgba(90,90,140,0.45), transparent),
+            radial-gradient(ellipse 400px 90px at 85% 15%, rgba(100,90,150,0.35), transparent),
+            radial-gradient(ellipse 550px 110px at 30% 45%, rgba(70,70,120,0.3), transparent);
+          animation: cloud-drift 60s ease-in-out infinite alternate;
         }
         @media (prefers-reduced-motion: no-preference) {
           #main-player-card {
             transition: transform 0.05s ease-out, box-shadow 0.08s ease-out, border-color 0.1s ease-out;
+            transform-style: preserve-3d;
           }
+          /* 2D hitbox wrapper — always flat, stable cursor */
+          .btn-wrap {
+            background: none;
+            border: none;
+            padding: 4px;
+            cursor: pointer;
+            position: relative;
+            outline: none;
+          }
+          .btn-wrap:disabled {
+            cursor: not-allowed;
+          }
+          /* 3D visual — never receives pointer events */
+          .btn-3d {
+            pointer-events: none;
+            transform: translateZ(8px);
+            transition: transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.18s ease-out, color 0.15s ease-out, filter 0.15s ease-out;
+            backface-visibility: hidden;
+          }
+          .btn-3d.hovered {
+            transform: translateZ(28px) rotateX(-6deg) scale(1.12);
+            box-shadow: 0 18px 30px rgba(0,0,0,0.5), 0 0 15px var(--theme-color-dim);
+            color: var(--theme-color);
+            filter: brightness(1.2);
+          }
+          .btn-3d.pressed {
+            transform: translateZ(2px) rotateX(2deg) scale(0.92);
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            transition-duration: 0.06s;
+          }
+          .avatar-3d {
+            transform: translateZ(30px);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.3);
+          }
+          .text-3d {
+            transform: translateZ(20px);
+            text-shadow: 0 5px 10px rgba(0,0,0,0.1);
+          }
+          .waveform-3d {
+            transform: translateZ(35px);
+          }
+        }
+        
+        /* ── WaveSurfer Custom Neon Glow ── */
+        .wavesurfer-glow {
+          filter: drop-shadow(0 0 6px var(--theme-color-dim));
+        }
+        .wavesurfer-glow::part(progress) {
+          filter:
+            brightness(1.3)
+            drop-shadow(0 0 6px var(--theme-color))
+            drop-shadow(0 0 14px var(--theme-color))
+            drop-shadow(0 0 28px var(--theme-color-dim)) !important;
+        }
+        .wavesurfer-glow::part(cursor) {
+          box-shadow:
+            0 0 8px 2px var(--theme-color),
+            0 0 20px 4px var(--theme-color-dim);
         }
       `}</style>
     <div
       id="player-bg"
       style={{
+        position: "fixed",
+        inset: 0,
         width: "100vw",
         height: "100vh",
         background: "#000",
+        boxShadow: "inset 0 0 250px rgba(0,0,0,0.9)", // Add dark fullscreen vignette
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
         overflow: "hidden",
+        overscrollBehavior: "none",
         fontFamily: "var(--font-sans)",
         userSelect: "none",
-        position: "relative",
+        maxWidth: "100vw",
+        maxHeight: "100vh",
       }}
     >
       {/* ── THREE.JS VISUALIZER BACKGROUND ── */}
@@ -828,6 +1261,65 @@ export default function PlayerPage() {
         />
       </div>
 
+      {/* ── CLOUDS ── */}
+      <div className="cloud-layer" aria-hidden="true" />
+
+      {/* ── RAIN ── */}
+      <div className="rain-layer" aria-hidden="true">
+        {Array.from({ length: 80 }, (_, i) => {
+          // Deterministic pseudo-random per index to avoid hydration mismatch
+          const s = (i * 2654435761 >>> 0) / 4294967296;
+          const s2 = ((i * 2654435761 + 1013904223) >>> 0) / 4294967296;
+          const s3 = ((i * 1664525 + 1013904223) >>> 0) / 4294967296;
+          const s4 = ((i * 1103515245 + 12345) >>> 0) / 4294967296;
+          const s5 = ((i * 214013 + 2531011) >>> 0) / 4294967296;
+          return (
+            <div
+              key={i}
+              className="rain-drop"
+              style={{
+                left: `${s * 100}%`,
+                height: `${40 + s2 * 80}px`,
+                animationDuration: `${0.6 + s3 * 0.8}s`,
+                animationDelay: `${s4 * 2}s`,
+                opacity: 0.15 + s5 * 0.25,
+              }}
+            />
+          );
+        })}
+      </div>
+
+      {/* ── VIDEO PARTICLE OVERLAY ── */}
+      <div
+        id="particle-overlay"
+        aria-hidden="true"
+        style={{
+          position: "absolute",
+          inset: 0,
+          width: "100%",
+          height: "100%",
+          zIndex: 1,
+          pointerEvents: "none",
+          mixBlendMode: "screen",
+          opacity: 0.45,
+          filter: "hue-rotate(0deg) saturate(1.4)",
+        }}
+      >
+        <video
+          autoPlay
+          loop
+          muted
+          playsInline
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+          }}
+        >
+          <source src="/particles.mp4" type="video/mp4" />
+        </video>
+      </div>
+
       {isLoading && (
         <div
           role="status"
@@ -845,62 +1337,86 @@ export default function PlayerPage() {
 
       {/* ── CENTERED STREAM CARD ── */}
       <div
-        id="main-player-card"
+        id="main-player-wrap"
         style={{
-          width: 800,
-          maxWidth: "90%",
-          background: "#fff",
-          border: "4px solid #000",
-          boxShadow: "16px 16px 0 #a78bfa",
+          width: "90vw",
+          maxWidth: 1400,
           display: "flex",
           flexDirection: "column",
+          alignItems: "center",
           zIndex: 10,
           position: "relative",
-          padding: 32,
           gap: 24,
-          transition: "transform 0.05s ease-out",
+          perspective: "1200px",
         }}
       >
+        {/* Inner div that gets the 3D shake/tilt — controls stay outside */}
+        <div
+          id="main-card-area"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: 24,
+            width: "100%",
+            transformStyle: "preserve-3d",
+          }}
+        >
         {/* ── HEADER B&W ── */}
         <header
           style={{
             display: "flex",
             alignItems: "center",
-            justifyContent: "space-between",
-            flexShrink: 0,
-            borderBottom: "4px solid #000",
-            paddingBottom: 16,
+            gap: 24,
+            padding: "16px 32px",
+            background: "rgba(255, 255, 255, 0.15)",
+            backdropFilter: "blur(20px)",
+            borderRadius: 100,
+            border: "1px solid rgba(255, 255, 255, 0.3)",
+            boxShadow: "0 10px 40px rgba(0,0,0,0.3)",
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <span
               style={{
-                fontSize: 24,
+                fontSize: 16,
                 fontWeight: 900,
-                letterSpacing: "-0.05em",
-                color: "#000",
+                color: "#fff",
                 textTransform: "uppercase",
               }}
             >
               WAVE PLAYER / {queueCount || 0} WAITING
             </span>
+            <a
+              href="/history"
+              title="View history"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 32,
+                height: 32,
+                borderRadius: "50%",
+                background: "rgba(255,255,255,0.1)",
+                color: "rgba(255,255,255,0.6)",
+                border: "none",
+                textDecoration: "none",
+                transition: "all 0.15s",
+                marginLeft: 4,
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.25)"; e.currentTarget.style.color = "#fff"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.1)"; e.currentTarget.style.color = "rgba(255,255,255,0.6)"; }}
+            >
+              <History size={16} />
+            </a>
           </div>
-        </header>
-
-        {/* ── SUBMISSION CARD ── */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 16,
-            flexShrink: 0,
-            minHeight: 80,
-          }}
-        >
+        {/* ── SUBMISSION INFO CONTINUED ── */}
           {current ? (
             <>
+              <div style={{ width: 1, height: 24, background: "rgba(255,255,255,0.3)" }} />
               {/* Avatar */}
               <div
+                className="avatar-3d"
                 aria-hidden="true"
                 style={{
                   width: 40,
@@ -909,7 +1425,7 @@ export default function PlayerPage() {
                   overflow: "hidden",
                   flexShrink: 0,
                   background: "#000",
-                  border: "2px solid #000",
+                  border: "2px solid rgba(255, 255, 255, 0.5)",
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
@@ -935,24 +1451,12 @@ export default function PlayerPage() {
               </div>
 
               {/* Name + note */}
-              <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column-reverse" }}>
-                <p
-                  style={{
-                    fontSize: 14,
-                    fontWeight: 600,
-                    color: "#666",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {current.artistNote ? current.artistNote : "Untitled Track"}
-                </p>
+              <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
                 <p
                   style={{
                     fontWeight: 900,
-                    fontSize: 28,
-                    color: "#000",
+                    fontSize: 20,
+                    color: "#fff",
                     lineHeight: 1.1,
                     overflow: "hidden",
                     textOverflow: "ellipsis",
@@ -961,64 +1465,110 @@ export default function PlayerPage() {
                 >
                   {current.artistName}
                 </p>
+                <p
+                  style={{
+                    fontSize: 14,
+                    fontWeight: 600,
+                    color: "rgba(255, 255, 255, 0.6)",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {current.artistNote ? current.artistNote : "Untitled Track"}
+                </p>
               </div>
+
+              <div style={{ width: 1, height: 24, background: "rgba(255,255,255,0.3)" }} />
 
               {/* Time display */}
               <div
+                className="text-3d"
                 aria-label={fmtTime(currentTime) + " of " + fmtTime(duration)}
                 style={{
                   fontFamily: "var(--font-mono)",
-                  fontSize: 20,
+                  fontSize: 16,
                   fontWeight: 900,
                   letterSpacing: "-0.05em",
-                  color: "#000",
+                  color: "#fff",
                   flexShrink: 0,
                 }}
               >
                 <span>{fmtTime(currentTime)}</span>
-                <span style={{ margin: "0 4px", color: "#a78bfa" }}>/</span>
+                <span style={{ margin: "0 4px", color: "var(--theme-color)" }}>/</span>
                 <span>{fmtTime(duration)}</span>
               </div>
 
               {/* Progress pill */}
               <div
+                className="text-3d"
                 aria-hidden="true"
                 style={{
-                  padding: "4px 16px",
-                  background: "#000",
+                  padding: "4px 12px",
+                  background: "rgba(255,255,255,0.2)",
                   color: "#fff",
+                  borderRadius: 100,
                   fontWeight: 900,
-                  fontSize: 14,
+                  fontSize: 12,
                   flexShrink: 0,
-                  boxShadow: "4px 4px 0 #a78bfa",
                 }}
               >
                 {activeIdx + 1} / {queue.length}
               </div>
             </>
           ) : (
-            <p style={{ color: "#000", fontSize: 16, fontWeight: 700 }}>
+            <p style={{ color: "#fff", fontSize: 16, fontWeight: 700 }}>
               {isLoading ? "LOADING..." : "NO TRACK SELECTED"}
             </p>
           )}
-        </div>
+        </header>
 
         {/* ── WAVEFORM ── */}
         <div
+          id="main-player-card"
+          className="waveform-3d"
           style={{
-            padding: "16px",
-            background: "#fff",
-            flexShrink: 0,
-            borderTop: "4px solid #000",
-            borderBottom: "4px solid #000",
+            width: "100%",
+            height: 250,
+            padding: "24px",
+            background: "rgba(255, 255, 255, 0.15)",
+            backdropFilter: "blur(40px)",
+            borderRadius: 32,
+            border: "1px solid rgba(255, 255, 255, 0.2)",
+            boxShadow: "0 25px 60px rgba(0,0,0,0.5)",
+            display: "flex",
+            alignItems: "center",
+            position: "relative",
           }}
         >
-          <div style={{ position: "relative", height: 72 }}>
+          <div style={{ position: "relative", width: "100%", height: 250 }}>
+            <canvas
+              ref={oscCanvasRef}
+              width={1400}
+              height={250}
+              className="absolute inset-0 pointer-events-none z-10"
+              style={{
+                position: "absolute",
+                top: 0,
+                left: 0,
+                width: "100%",
+                height: "100%",
+                pointerEvents: "none",
+                zIndex: 10,
+              }}
+            />
             {/* WaveSurfer container — normal flow so it gets real width */}
             <div
               ref={waveformRef}
+              className="wavesurfer-glow"
               aria-label="Waveform — click to seek"
-              style={{ height: 72 }}
+              style={{
+                height: 250,
+                position: "absolute",
+                inset: 0,
+                zIndex: 1,
+                opacity: 1.0,
+              }}
             />
             {/* Loading overlay — sits on top until waveform is ready */}
             {!(current && waveReady) && (
@@ -1031,7 +1581,8 @@ export default function PlayerPage() {
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
-                  background: "#fff",
+                  borderRadius: 16,
+                  overflow: "hidden",
                   zIndex: 2,
                 }}
               >
@@ -1040,12 +1591,12 @@ export default function PlayerPage() {
                     flex: 1,
                     height: 8,
                     background: current
-                      ? "linear-gradient(90deg, #000 0%, #a78bfa " +
+                      ? "linear-gradient(90deg, rgba(255,255,255,0.1) 0%, var(--theme-color) " +
                         progress * 100 +
-                        "%, #000 " +
+                        "%, rgba(255,255,255,0.1) " +
                         progress * 100 +
                         "%)"
-                      : "#000",
+                      : "rgba(255,255,255,0.1)",
                     transition: "background 0.1s linear",
                   }}
                 />
@@ -1054,195 +1605,158 @@ export default function PlayerPage() {
           </div>
         </div>
 
-        {/* ── CONTROLS ── */}
+        {/* ── CONTROLS (3D visual only — no pointer events) ── */}
         <div
-          role="toolbar"
-          aria-label="Playback controls"
+          id="controls-visual"
+          aria-hidden="true"
           style={{
             display: "flex",
             alignItems: "center",
-            justifyContent: "space-between",
-            flexShrink: 0,
+            justifyContent: "center",
+            gap: 24,
+            padding: "16px 32px",
+            background: "rgba(255, 255, 255, 0.15)",
+            backdropFilter: "blur(20px)",
+            borderRadius: 100,
+            border: "1px solid rgba(255, 255, 255, 0.3)",
+            boxShadow: "0 10px 40px rgba(0,0,0,0.3)",
+            transformStyle: "preserve-3d" as any,
+            perspective: "200px",
+            pointerEvents: "none",
           }}
         >
+          {/* Dislike */}
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <span data-btn="dislike" className="btn-3d" style={{
+              width: 48, height: 48, borderRadius: "50%",
+              background: reactedWith === "DISLIKE" ? "var(--theme-color)" : "rgba(0,0,0,0.3)",
+              color: reactedWith === "DISLIKE" ? "#000" : "#fff",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}><ThumbsDown size={20} /></span>
+          </div>
+          <div style={{ width: 1, height: 32, background: "rgba(255,255,255,0.3)" }} />
           {/* Transport */}
           <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-            <button
-              onClick={goPrev}
-              disabled={activeIdx === 0}
-              aria-label="Previous track"
-              style={{
-                width: 48,
-                height: 48,
-                background: "#fff",
-                border: "4px solid #000",
-                color: "#000",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                cursor: activeIdx === 0 ? "not-allowed" : "pointer",
-                opacity: activeIdx === 0 ? 0.5 : 1,
-                boxShadow: activeIdx === 0 ? "none" : "4px 4px 0 #a78bfa",
-              }}
-            >
-              <SkipBack fill="currentColor" size={20} />
-            </button>
-
-            <button
-              onClick={togglePlay}
-              disabled={!current || !waveReady}
-              aria-label={isPlaying ? "Pause" : "Play"}
-              aria-pressed={isPlaying}
-              style={{
-                width: 64,
-                height: 64,
-                background:
-                  current && waveReady
-                    ? "#000"
-                    : "#fff",
-                border: "4px solid #000",
-                cursor: current && waveReady ? "pointer" : "not-allowed",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                color:
-                  current && waveReady
-                    ? "#fff"
-                    : "#ccc",
-                boxShadow:
-                  current && waveReady ? "6px 6px 0 #a78bfa" : "none",
-                transition: "transform 0.1s ease, box-shadow 0.1s ease",
-              }}
-              onMouseDown={(e) => {
-                if (!e.currentTarget.disabled) {
-                  e.currentTarget.style.transform = "translate(2px, 2px)";
-                  e.currentTarget.style.boxShadow = "4px 4px 0 #a78bfa";
-                }
-              }}
-              onMouseUp={(e) => {
-                if (!e.currentTarget.disabled) {
-                  e.currentTarget.style.transform = "";
-                  e.currentTarget.style.boxShadow = "6px 6px 0 #a78bfa";
-                }
-              }}
-              onMouseLeave={(e) => {
-                if (!e.currentTarget.disabled) {
-                  e.currentTarget.style.transform = "";
-                  e.currentTarget.style.boxShadow = "6px 6px 0 #a78bfa";
-                }
-              }}
-            >
-              {isPlaying ? (
-                <Pause size={32} fill="currentColor" />
-              ) : (
-                <Play size={32} fill="currentColor" />
-              )}
-            </button>
-
-            <button
-              onClick={goNext}
-              disabled={activeIdx >= queue.length - 1}
-              aria-label="Next track"
-              style={{
-                width: 48,
-                height: 48,
-                background: "#fff",
-                border: "4px solid #000",
-                color: "#000",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                cursor: activeIdx >= queue.length - 1 ? "not-allowed" : "pointer",
-                opacity: activeIdx >= queue.length - 1 ? 0.5 : 1,
-                boxShadow: activeIdx >= queue.length - 1 ? "none" : "4px 4px 0 #a78bfa",
-              }}
-            >
-              <SkipForward fill="currentColor" size={20} />
-            </button>
+            <span data-btn="prev" className="btn-3d" style={{
+              width: 48, height: 48, borderRadius: "50%",
+              background: "rgba(0,0,0,0.3)", color: "#fff",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              opacity: activeIdx === 0 ? 0.3 : 1,
+            }}><SkipBack fill="currentColor" size={20} /></span>
+            <span data-btn="play" className="btn-3d" style={{
+              width: 64, height: 64, borderRadius: "50%",
+              background: "#fff", color: "#000",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              opacity: current && waveReady ? 1 : 0.5,
+            }}>
+              {isPlaying ? <Pause size={32} fill="currentColor" /> : <Play size={32} fill="currentColor" />}
+            </span>
+            <span data-btn="next" className="btn-3d" style={{
+              width: 48, height: 48, borderRadius: "50%",
+              background: "rgba(0,0,0,0.3)", color: "#fff",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              opacity: activeIdx >= queue.length - 1 ? 0.3 : 1,
+            }}><SkipForward fill="currentColor" size={20} /></span>
           </div>
-
-          {/* Spacer */}
-          <div style={{ flex: 1 }} />
-
-          {/* Reaction buttons */}
-          <div
-            role="group"
-            aria-label="Rate this track"
-            style={{ display: "flex", alignItems: "center", gap: 12 }}
-          >
-            {(["LIKE", "DISLIKE", "FIRE"] as ReactionType[]).map((type) => {
-              const icon =
-                type === "LIKE" ? (
-                  <ThumbsUp size={24} />
-                ) : type === "DISLIKE" ? (
-                  <ThumbsDown size={24} />
-                ) : (
-                  <Flame size={24} />
-                );
-              const label =
-                type === "LIKE"
-                  ? "Like"
-                  : type === "DISLIKE"
-                    ? "Dislike"
-                    : "Fire";
-              const active = reactedWith === type;
-              const muted = !!reactedWith && !active;
-
-              return (
-                <button
-                  key={type}
-                  onClick={() => react(type)}
-                  disabled={!current || (!!reactedWith && !active)}
-                  aria-label={label}
-                  aria-pressed={active}
-                  style={{
-                    height: 48,
-                    minWidth: 64,
-                    padding: "0 16px",
-                    borderRadius: 0,
-                    border: "4px solid #000",
-                    background: active
-                      ? "#a78bfa"
-                      : "#fff",
-                    color: "#000",
-                    cursor:
-                      !current || (!!reactedWith && !active)
-                        ? "not-allowed"
-                        : "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    opacity: muted ? 0.35 : 1,
-                    transform: active ? "translate(2px, 2px)" : "none",
-                    boxShadow:
-                      active || muted ? "none" : "4px 4px 0 #a78bfa",
-                    transition: "all 0.1s ease",
-                  }}
-                  onMouseDown={(e) => {
-                    if (!e.currentTarget.disabled && !active) {
-                      e.currentTarget.style.transform = "translate(2px, 2px)";
-                      e.currentTarget.style.boxShadow = "none";
-                    }
-                  }}
-                  onMouseUp={(e) => {
-                    if (!e.currentTarget.disabled && !active) {
-                      e.currentTarget.style.transform = "";
-                      e.currentTarget.style.boxShadow = "4px 4px 0 #a78bfa";
-                    }
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!e.currentTarget.disabled && !active) {
-                      e.currentTarget.style.transform = "";
-                      e.currentTarget.style.boxShadow = "4px 4px 0 #a78bfa";
-                    }
-                  }}
-                >
-                  {icon}
-                </button>
-              );
-            })}
+          <div style={{ width: 1, height: 32, background: "rgba(255,255,255,0.3)" }} />
+          {/* Reactions */}
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <span data-btn="like" className="btn-3d" style={{
+              width: 48, height: 48, borderRadius: "50%",
+              background: reactedWith === "LIKE" ? "var(--theme-color)" : "rgba(0,0,0,0.3)",
+              color: reactedWith === "LIKE" ? "#000" : "#fff",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}><ThumbsUp size={20} /></span>
+            <span data-btn="fire" className="btn-3d" style={{
+              width: 48, height: 48, borderRadius: "50%",
+              background: reactedWith === "FIRE" ? "var(--theme-color)" : "rgba(0,0,0,0.3)",
+              color: reactedWith === "FIRE" ? "#000" : "#fff",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}><Flame size={20} /></span>
           </div>
         </div>
+      </div>{/* end main-card-area */}
+
+      </div>{/* end main-player-wrap */}
+    </div>{/* end player-bg */}
+
+    {/* ── CONTROLS 2D HITBOX (tracks 3D visual position, outside all transforms) ── */}
+    <div
+      id="controls-hitbox"
+      role="toolbar"
+      aria-label="Playback controls"
+      style={{
+        position: "fixed",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 24,
+        padding: "16px 32px",
+        zIndex: 9999,
+        borderRadius: 100,
+      }}
+    >
+      {/* Reaction left */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <button className="btn-wrap"
+          onClick={() => react("DISLIKE")}
+          disabled={!current || (!!reactedWith && reactedWith !== "DISLIKE")}
+          aria-label="Dislike" aria-pressed={reactedWith === "DISLIKE"}
+          onMouseEnter={() => document.querySelector('#controls-visual [data-btn="dislike"]')?.classList.add("hovered")}
+          onMouseLeave={() => document.querySelector('#controls-visual [data-btn="dislike"]')?.classList.remove("hovered","pressed")}
+          onMouseDown={() => document.querySelector('#controls-visual [data-btn="dislike"]')?.classList.add("pressed")}
+          onMouseUp={() => document.querySelector('#controls-visual [data-btn="dislike"]')?.classList.remove("pressed")}
+        ><span style={{ width: 48, height: 48, display: "block" }} /></button>
+      </div>
+      <div style={{ width: 1, height: 32 }} />
+      {/* Transport */}
+      <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+        <button className="btn-wrap"
+          onClick={goPrev} disabled={activeIdx === 0}
+          aria-label="Previous track"
+          onMouseEnter={() => document.querySelector('#controls-visual [data-btn="prev"]')?.classList.add("hovered")}
+          onMouseLeave={() => document.querySelector('#controls-visual [data-btn="prev"]')?.classList.remove("hovered","pressed")}
+          onMouseDown={() => document.querySelector('#controls-visual [data-btn="prev"]')?.classList.add("pressed")}
+          onMouseUp={() => document.querySelector('#controls-visual [data-btn="prev"]')?.classList.remove("pressed")}
+        ><span style={{ width: 48, height: 48, display: "block" }} /></button>
+        <button className="btn-wrap"
+          onClick={togglePlay} disabled={!current || !waveReady}
+          aria-label={isPlaying ? "Pause" : "Play"} aria-pressed={isPlaying}
+          onMouseEnter={() => document.querySelector('#controls-visual [data-btn="play"]')?.classList.add("hovered")}
+          onMouseLeave={() => document.querySelector('#controls-visual [data-btn="play"]')?.classList.remove("hovered","pressed")}
+          onMouseDown={() => document.querySelector('#controls-visual [data-btn="play"]')?.classList.add("pressed")}
+          onMouseUp={() => document.querySelector('#controls-visual [data-btn="play"]')?.classList.remove("pressed")}
+        ><span style={{ width: 64, height: 64, display: "block" }} /></button>
+        <button className="btn-wrap"
+          onClick={goNext} disabled={activeIdx >= queue.length - 1}
+          aria-label="Next track"
+          onMouseEnter={() => document.querySelector('#controls-visual [data-btn="next"]')?.classList.add("hovered")}
+          onMouseLeave={() => document.querySelector('#controls-visual [data-btn="next"]')?.classList.remove("hovered","pressed")}
+          onMouseDown={() => document.querySelector('#controls-visual [data-btn="next"]')?.classList.add("pressed")}
+          onMouseUp={() => document.querySelector('#controls-visual [data-btn="next"]')?.classList.remove("pressed")}
+        ><span style={{ width: 48, height: 48, display: "block" }} /></button>
+      </div>
+      <div style={{ width: 1, height: 32 }} />
+      {/* Reaction right */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <button className="btn-wrap"
+          onClick={() => react("LIKE")}
+          disabled={!current || (!!reactedWith && reactedWith !== "LIKE")}
+          aria-label="Like" aria-pressed={reactedWith === "LIKE"}
+          onMouseEnter={() => document.querySelector('#controls-visual [data-btn="like"]')?.classList.add("hovered")}
+          onMouseLeave={() => document.querySelector('#controls-visual [data-btn="like"]')?.classList.remove("hovered","pressed")}
+          onMouseDown={() => document.querySelector('#controls-visual [data-btn="like"]')?.classList.add("pressed")}
+          onMouseUp={() => document.querySelector('#controls-visual [data-btn="like"]')?.classList.remove("pressed")}
+        ><span style={{ width: 48, height: 48, display: "block" }} /></button>
+        <button className="btn-wrap"
+          onClick={() => react("FIRE")}
+          disabled={!current || (!!reactedWith && reactedWith !== "FIRE")}
+          aria-label="Fire" aria-pressed={reactedWith === "FIRE"}
+          onMouseEnter={() => document.querySelector('#controls-visual [data-btn="fire"]')?.classList.add("hovered")}
+          onMouseLeave={() => document.querySelector('#controls-visual [data-btn="fire"]')?.classList.remove("hovered","pressed")}
+          onMouseDown={() => document.querySelector('#controls-visual [data-btn="fire"]')?.classList.add("pressed")}
+          onMouseUp={() => document.querySelector('#controls-visual [data-btn="fire"]')?.classList.remove("pressed")}
+        ><span style={{ width: 48, height: 48, display: "block" }} /></button>
       </div>
     </div>
     </>
