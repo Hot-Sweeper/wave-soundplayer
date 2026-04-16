@@ -36,6 +36,9 @@ const DEFAULT_SAMPLE_RATE = 44100;
 const VISUALIZER_MIN_FREQ = 30;
 const VISUALIZER_MAX_FREQ = 16000;
 const BEAT_HISTORY_FRAMES = 43;
+const EFFECTS_TARGET_RMS = 0.2;
+const EFFECTS_MIN_GAIN = 0.85;
+const EFFECTS_MAX_GAIN = 3.4;
 
 /* ─── Frequency band helpers ────────────────────────────────── */
 function freqToBin(
@@ -122,6 +125,9 @@ export default function PlayerPage() {
   const [reactedWith, setReactedWith] = useState<ReactionType | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [waveReady, setWaveReady] = useState(false);
+  const [autoPlayEnabled, setAutoPlayEnabled] = useState(false);
+  const [waveLoadPct, setWaveLoadPct] = useState(0);
+  const [preloadingNextId, setPreloadingNextId] = useState<string | null>(null);
 
   /* DOM refs */
   const waveformRef = useRef<HTMLDivElement>(null);
@@ -155,6 +161,11 @@ export default function PlayerPage() {
   const currentIdRef = useRef<string | null>(null);
   const activeIdxRef = useRef(0);
   activeIdxRef.current = activeIdx;
+  const autoPlayEnabledRef = useRef(false);
+  autoPlayEnabledRef.current = autoPlayEnabled;
+  const autoAdvanceRef = useRef(false);
+  const preloadedTrackRef = useRef<{ id: string; blob: Blob } | null>(null);
+  const preloadAbortRef = useRef<AbortController | null>(null);
 
   const current = queue[activeIdx] ?? null;
 
@@ -175,6 +186,17 @@ export default function PlayerPage() {
     fetchQueue();
   }, [fetchQueue]);
 
+  useEffect(() => {
+    const saved = window.localStorage.getItem("wave.autoplay");
+    if (saved === "1") {
+      setAutoPlayEnabled(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("wave.autoplay", autoPlayEnabled ? "1" : "0");
+  }, [autoPlayEnabled]);
+
   /* ─── SSE: live queue count ─── */
   useEffect(() => {
     const es = new EventSource("/api/events/queue-count");
@@ -187,6 +209,35 @@ export default function PlayerPage() {
       }
     };
     return () => es.close();
+  }, []);
+
+  const markSubmissionPlayed = useCallback(async (submissionId: string) => {
+    try {
+      await fetch(`/api/submissions/${submissionId}/played`, {
+        method: "PUT",
+      });
+    } catch {
+      /* silent */
+    }
+  }, []);
+
+  const loadTrackIntoPlayer = useCallback((submission: Submission) => {
+    if (!wsRef.current) return;
+
+    const preloaded = preloadedTrackRef.current;
+    setWaveReady(false);
+    setWaveLoadPct(0);
+
+    if (preloaded?.id === submission.id) {
+      console.log("[WS] loading preloaded blob:", submission.id);
+      void wsRef.current.loadBlob(preloaded.blob);
+      preloadedTrackRef.current = null;
+      setPreloadingNextId((value) => (value === submission.id ? null : value));
+      return;
+    }
+
+    console.log("[WS] loading track via url:", submission.id);
+    wsRef.current.load("/api/audio/" + submission.id);
   }, []);
 
   /* ─── Three.js: init once ─── */
@@ -465,6 +516,11 @@ export default function PlayerPage() {
       let cameraShakeX = 0;
       let cameraShakeY = 0;
       let kickArmed = true;
+      let effectsGain = 1;
+      let bassEffectsGain = 1;
+      let normalizedFreqData = new Uint8Array(fftDataRef.current.length);
+      let normalizedTimeData = new Uint8Array(timeDataRef.current.length);
+      let normalizedBassTimeData = new Uint8Array(bassTimeDataRef.current.length);
 
       // Ripple state
       let currentRippleRadius = 0;
@@ -478,6 +534,23 @@ export default function PlayerPage() {
           sumSq += centered * centered;
         }
         return Math.sqrt(sumSq / frame.length);
+      }
+
+      function clamp(value: number, min: number, max: number): number {
+        return Math.max(min, Math.min(max, value));
+      }
+
+      function normalizeTimeDomain(source: Uint8Array, target: Uint8Array, gain: number) {
+        for (let i = 0; i < source.length; i++) {
+          const centered = (source[i] - 128) * gain;
+          target[i] = clamp(Math.round(centered + 128), 0, 255);
+        }
+      }
+
+      function normalizeFrequencyDomain(source: Uint8Array, target: Uint8Array, gain: number) {
+        for (let i = 0; i < source.length; i++) {
+          target[i] = clamp(Math.round(source[i] * gain), 0, 255);
+        }
       }
 
       function animate(now: number) {
@@ -503,9 +576,38 @@ export default function PlayerPage() {
         const sampleRate = audioCtxRef.current?.sampleRate ?? DEFAULT_SAMPLE_RATE;
         const fftSize = analyserRef.current?.fftSize ?? ANALYSER_FFT_SIZE;
 
+        if (normalizedFreqData.length !== data.length) {
+          normalizedFreqData = new Uint8Array(data.length);
+        }
+        if (normalizedTimeData.length !== timeDataRef.current.length) {
+          normalizedTimeData = new Uint8Array(timeDataRef.current.length);
+        }
+        if (normalizedBassTimeData.length !== bassTimeDataRef.current.length) {
+          normalizedBassTimeData = new Uint8Array(bassTimeDataRef.current.length);
+        }
+
+        const rawRms = calcRms(timeDataRef.current);
+        const rawBassRms = calcRms(bassTimeDataRef.current);
+        const targetEffectsGain = clamp(
+          EFFECTS_TARGET_RMS / Math.max(rawRms, 0.06),
+          EFFECTS_MIN_GAIN,
+          EFFECTS_MAX_GAIN,
+        );
+        const targetBassEffectsGain = clamp(
+          EFFECTS_TARGET_RMS / Math.max(rawBassRms, 0.05),
+          EFFECTS_MIN_GAIN,
+          EFFECTS_MAX_GAIN,
+        );
+        effectsGain += (targetEffectsGain - effectsGain) * 0.08;
+        bassEffectsGain += (targetBassEffectsGain - bassEffectsGain) * 0.1;
+
+        normalizeFrequencyDomain(data, normalizedFreqData, effectsGain);
+        normalizeTimeDomain(timeDataRef.current, normalizedTimeData, effectsGain);
+        normalizeTimeDomain(bassTimeDataRef.current, normalizedBassTimeData, bassEffectsGain);
+
         /* Full-mix RMS envelope for macro motion and particle speed. */
-        const rms = calcRms(timeDataRef.current);
-        const bassRms = calcRms(bassTimeDataRef.current);
+        const rms = calcRms(normalizedTimeData);
+        const bassRms = calcRms(normalizedBassTimeData);
         ampFast += 0.28 * (rms - ampFast);
         ampSlow += 0.07 * (rms - ampSlow);
         const prevBassFast = bassFast;
@@ -514,11 +616,11 @@ export default function PlayerPage() {
         bassRise = Math.max(0, bassFast - prevBassFast);
 
         /* Band energies */
-        const rawSubBass = bandEnergyHz(data, sampleRate, fftSize, 20, 60);
-        const rawBass = bandEnergyHz(data, sampleRate, fftSize, 20, 130);
-        const rawKick = bandEnergyHz(data, sampleRate, fftSize, 45, 130);
-        const rawMid = bandEnergyHz(data, sampleRate, fftSize, 130, 350);
-        const rawHigh = bandEnergyHz(data, sampleRate, fftSize, 2000, 8000);
+        const rawSubBass = bandEnergyHz(normalizedFreqData, sampleRate, fftSize, 20, 60);
+        const rawBass = bandEnergyHz(normalizedFreqData, sampleRate, fftSize, 20, 130);
+        const rawKick = bandEnergyHz(normalizedFreqData, sampleRate, fftSize, 45, 130);
+        const rawMid = bandEnergyHz(normalizedFreqData, sampleRate, fftSize, 130, 350);
+        const rawHigh = bandEnergyHz(normalizedFreqData, sampleRate, fftSize, 2000, 8000);
 
         /* Smooth with different attack/release for punchiness */
         const subBassAtk = 0.55, subBassRel = 0.1;
@@ -532,7 +634,7 @@ export default function PlayerPage() {
 
         /* Total energy */
         let totalEnergy = 0;
-        for (let k = 0; k < data.length; k++) totalEnergy += data[k];
+        for (let k = 0; k < normalizedFreqData.length; k++) totalEnergy += normalizedFreqData[k];
         const idle = totalEnergy < 150;
 
         /* Kick detection — sidechain-style low-end envelope with hysteresis and cooldown. */
@@ -575,11 +677,11 @@ export default function PlayerPage() {
               logFrequencyAt(i, BAR_COUNT, VISUALIZER_MIN_FREQ, VISUALIZER_MAX_FREQ),
               sampleRate,
               fftSize,
-              data.length - 1,
+              normalizedFreqData.length - 1,
             );
             // Square the value to create artificial dynamic range, preventing clipping
             // on excessively loud/compressed songs.
-            const val = Math.pow(data[binIndex] / 255, 2.0);
+            const val = Math.pow(normalizedFreqData[binIndex] / 255, 2.0);
             targetH = Math.max(0.04, val * MAX_BAR_H);
           }
 
@@ -597,9 +699,9 @@ export default function PlayerPage() {
               logFrequencyAt(i, BAR_COUNT, VISUALIZER_MIN_FREQ, VISUALIZER_MAX_FREQ),
               sampleRate,
               fftSize,
-              data.length - 1,
+              normalizedFreqData.length - 1,
             );
-            const intensity = data[binIndex] / 255;
+            const intensity = normalizedFreqData[binIndex] / 255;
             
             mat.color.copy(color);
             mat.emissive.copy(color);
@@ -810,6 +912,15 @@ export default function PlayerPage() {
           ctrlHitbox.style.height = r.height + "px";
         }
 
+        const waveformHitbox = document.getElementById("waveform-hitbox");
+        if (waveformRef.current && waveformHitbox) {
+          const r = waveformRef.current.getBoundingClientRect();
+          waveformHitbox.style.left = r.left + "px";
+          waveformHitbox.style.top = r.top + "px";
+          waveformHitbox.style.width = r.width + "px";
+          waveformHitbox.style.height = r.height + "px";
+        }
+
         /* ── CSS SHAKE CLASS for heavy bass hits ── */
         if (isKick && bgEl && !bgEl.classList.contains("shake-active")) {
           bgEl.classList.add("shake-active");
@@ -835,8 +946,8 @@ export default function PlayerPage() {
             const sliceWidth = w * 1.0 / timeDataRef.current.length;
             let x = 0;
             
-            for (let i = 0; i < timeDataRef.current.length; i++) {
-              const v = timeDataRef.current[i] / 128.0;
+            for (let i = 0; i < normalizedTimeData.length; i++) {
+              const v = normalizedTimeData[i] / 128.0;
               const y = v * h / 2;
               
               if (i === 0) {
@@ -928,8 +1039,8 @@ export default function PlayerPage() {
         barGap: 3,
         barRadius: 6,
         normalize: true,
-        interact: true,
-        dragToSeek: true,
+        interact: false,
+        dragToSeek: false,
       });
       (window as any).__ws = ws;
       console.log("[WS] instance created");
@@ -938,11 +1049,22 @@ export default function PlayerPage() {
         console.log("[WS] READY — duration:", ws.getDuration());
         setDuration(ws.getDuration());
         setWaveReady(true);
+        setWaveLoadPct(100);
+        if (autoAdvanceRef.current) {
+          autoAdvanceRef.current = false;
+          audioCtxRef.current?.resume();
+          try {
+            void ws.play();
+          } catch {
+            /* silent */
+          }
+        }
       });
 
       ws.on("error", (err: unknown) => {
         console.error("[WS] ERROR:", err);
         setWaveReady(false);
+        setWaveLoadPct(0);
         const q = queueRef.current;
         const nextIdx = activeIdxRef.current + 1;
         if (nextIdx < q.length) {
@@ -955,6 +1077,7 @@ export default function PlayerPage() {
 
       ws.on("loading", (pct: number) => {
         console.log("[WS] loading:", pct + "%");
+        setWaveLoadPct(pct);
       });
 
       ws.on("play", () => {
@@ -968,15 +1091,25 @@ export default function PlayerPage() {
 
       ws.on("finish", () => {
         setIsPlaying(false);
-        setWaveReady(false);
-        setTimeout(() => {
-          const q = queueRef.current;
-          const nextIdx = activeIdxRef.current + 1;
-          if (nextIdx < q.length) {
-            setReactedWith(null);
-            setActiveIdx(nextIdx);
-          }
-        }, 1400);
+        if (currentIdRef.current) {
+          void markSubmissionPlayed(currentIdRef.current);
+        }
+
+        const q = queueRef.current;
+        const nextIdx = activeIdxRef.current + 1;
+        if (autoPlayEnabledRef.current && nextIdx < q.length) {
+          autoAdvanceRef.current = true;
+          setWaveReady(false);
+          window.setTimeout(() => {
+            const upcomingIdx = activeIdxRef.current + 1;
+            if (upcomingIdx < queueRef.current.length) {
+              setReactedWith(null);
+              setActiveIdx(upcomingIdx);
+            } else {
+              autoAdvanceRef.current = false;
+            }
+          }, 280);
+        }
       });
 
       wsRef.current = ws;
@@ -985,19 +1118,25 @@ export default function PlayerPage() {
       /* If a track was already pending (queue loaded before wavesurfer) */
       if (currentIdRef.current) {
         console.log("[WS] loading pending track:", currentIdRef.current);
-        ws.load("/api/audio/" + currentIdRef.current);
-        setWaveReady(false);
+        const pendingTrack = queueRef.current.find((item) => item.id === currentIdRef.current);
+        if (pendingTrack) {
+          loadTrackIntoPlayer(pendingTrack);
+        } else {
+          ws.load("/api/audio/" + currentIdRef.current);
+          setWaveReady(false);
+        }
       } else {
         console.log("[WS] no pending track");
       }
     })().catch((err) => console.error("[WS] init failed:", err));
 
     return () => {
+      preloadAbortRef.current?.abort();
       wsRef.current?.destroy();
       wsRef.current = null;
       audioElRef.current = null;
     };
-  }, []);
+  }, [loadTrackIntoPlayer]);
 
       /* ─── Load track when current changes ─── */
   useEffect(() => {
@@ -1006,14 +1145,61 @@ export default function PlayerPage() {
     setCurrentTime(0);
     setDuration(0);
     setWaveReady(false);
+    setWaveLoadPct(0);
 
     if (!wsRef.current) {
       console.log("[WS] track changed but wsRef not ready yet, track:", current.id);
       return;
     }
-    console.log("[WS] loading track via useEffect:", current.id);
-    wsRef.current.load("/api/audio/" + current.id);
-  }, [current]);
+    loadTrackIntoPlayer(current);
+  }, [current, loadTrackIntoPlayer]);
+
+  useEffect(() => {
+    const nextTrack = queue[activeIdx + 1] ?? null;
+
+    preloadAbortRef.current?.abort();
+    preloadAbortRef.current = null;
+
+    if (!nextTrack) {
+      preloadedTrackRef.current = null;
+      setPreloadingNextId(null);
+      return;
+    }
+
+    if (preloadedTrackRef.current?.id === nextTrack.id) {
+      setPreloadingNextId(nextTrack.id);
+      return;
+    }
+
+    const controller = new AbortController();
+    preloadAbortRef.current = controller;
+    setPreloadingNextId(nextTrack.id);
+
+    void fetch(`/api/audio/${nextTrack.id}`, {
+      signal: controller.signal,
+      cache: "force-cache",
+    })
+      .then(async (res) => {
+        if (!res.ok) throw new Error("Failed to preload next track");
+        const blob = await res.blob();
+        if (!controller.signal.aborted) {
+          preloadedTrackRef.current = { id: nextTrack.id, blob };
+        }
+      })
+      .catch((err: unknown) => {
+        if ((err as { name?: string })?.name !== "AbortError") {
+          console.error("[WS] preload next failed:", err);
+          if (preloadedTrackRef.current?.id === nextTrack.id) {
+            preloadedTrackRef.current = null;
+          }
+          setPreloadingNextId(null);
+        }
+      });
+
+    return () => {
+      controller.abort();
+    };
+  }, [activeIdx, queue]);
 
   /* ─── Controls ─── */
   const togglePlay = useCallback(() => {
@@ -1054,6 +1240,7 @@ export default function PlayerPage() {
 
   const goPrev = () => {
     if (activeIdx > 0) {
+      autoAdvanceRef.current = isPlaying;
       setActiveIdx((i) => i - 1);
       setReactedWith(null);
       setWaveReady(false);
@@ -1062,10 +1249,15 @@ export default function PlayerPage() {
 
   const goNext = () => {
     if (activeIdx < queue.length - 1) {
+      autoAdvanceRef.current = isPlaying;
       setActiveIdx((i) => i + 1);
       setReactedWith(null);
       setWaveReady(false);
     }
+  };
+
+  const toggleAutoPlay = () => {
+    setAutoPlayEnabled((value) => !value);
   };
 
   const react = async (type: ReactionType) => {
@@ -1086,12 +1278,47 @@ export default function PlayerPage() {
     }
   };
 
+  const seekFromClientX = useCallback((clientX: number) => {
+    if (!wsRef.current || !current) return;
+    const hitbox = document.getElementById("waveform-hitbox");
+    if (!hitbox) return;
+
+    const rect = hitbox.getBoundingClientRect();
+    if (rect.width <= 0) return;
+
+    const localX = Math.min(rect.width, Math.max(0, clientX - rect.left));
+    const ratio = localX / rect.width;
+    wsRef.current.seekTo(ratio);
+  }, [current]);
+
+  const onWaveSeekPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!current || !waveReady) return;
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    seekFromClientX(e.clientX);
+  };
+
+  const onWaveSeekPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!current || !waveReady) return;
+    if (!(e.buttons & 1)) return;
+    seekFromClientX(e.clientX);
+  };
+
+  const onWaveSeekPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!current || !waveReady) return;
+    seekFromClientX(e.clientX);
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+  };
+
   /* ─── Derived values ─── */
   const avatarSrc = current?.avatarPath
     ? "/api/avatars/" + current.avatarPath.split("/").pop()
     : null;
 
   const progress = duration > 0 ? currentTime / duration : 0;
+  const nextQueuedTrack = queue[activeIdx + 1] ?? null;
 
   /* ─── Render ─────────────────────────────────────────────── */
   return (
@@ -1221,6 +1448,15 @@ export default function PlayerPage() {
           box-shadow:
             0 0 8px 2px var(--theme-color),
             0 0 20px 4px var(--theme-color-dim);
+        }
+        @keyframes waveform-loader-sweep {
+          0% { transform: translateX(-120%) skewX(-18deg); opacity: 0; }
+          20% { opacity: 1; }
+          100% { transform: translateX(220%) skewX(-18deg); opacity: 0; }
+        }
+        @keyframes waveform-loader-bars {
+          0%, 100% { transform: scaleY(0.35); opacity: 0.35; }
+          50% { transform: scaleY(1); opacity: 1; }
         }
       `}</style>
     <div
@@ -1411,7 +1647,7 @@ export default function PlayerPage() {
                 textTransform: "uppercase",
               }}
             >
-              WAVE PLAYER / {queueCount || 0} WAITING
+              WAVE PLAYER / {queueCount || 0} UNPLAYED
             </span>
             <a
               href="/history"
@@ -1594,6 +1830,7 @@ export default function PlayerPage() {
                 inset: 0,
                 zIndex: 1,
                 opacity: 1.0,
+                pointerEvents: "none",
               }}
             />
             {/* Loading overlay — sits on top until waveform is ready */}
@@ -1610,22 +1847,82 @@ export default function PlayerPage() {
                   borderRadius: 16,
                   overflow: "hidden",
                   zIndex: 2,
+                  background: "linear-gradient(180deg, rgba(4,10,26,0.78), rgba(5,9,20,0.92))",
                 }}
               >
                 <div
                   style={{
-                    flex: 1,
-                    height: 8,
-                    background: current
-                      ? "linear-gradient(90deg, rgba(255,255,255,0.1) 0%, var(--theme-color) " +
-                        progress * 100 +
-                        "%, rgba(255,255,255,0.1) " +
-                        progress * 100 +
-                        "%)"
-                      : "rgba(255,255,255,0.1)",
-                    transition: "background 0.1s linear",
+                    position: "absolute",
+                    inset: 0,
+                    background: "linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.16) 50%, transparent 100%)",
+                    animation: "waveform-loader-sweep 1.8s ease-in-out infinite",
+                    pointerEvents: "none",
                   }}
                 />
+                <div style={{
+                  position: "relative",
+                  zIndex: 1,
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  gap: 16,
+                  width: "100%",
+                  padding: "0 28px",
+                }}>
+                  <div style={{ display: "flex", alignItems: "flex-end", gap: 8, height: 48 }}>
+                    {[0, 1, 2, 3, 4, 5].map((index) => (
+                      <span
+                        key={index}
+                        style={{
+                          width: 10,
+                          height: 42,
+                          borderRadius: 999,
+                          background: index % 2 === 0 ? "var(--theme-color)" : "rgba(255,255,255,0.92)",
+                          transformOrigin: "center bottom",
+                          animation: `waveform-loader-bars ${0.72 + index * 0.08}s ease-in-out infinite`,
+                          animationDelay: `${index * 0.08}s`,
+                          boxShadow: index % 2 === 0 ? "0 0 18px var(--theme-color-dim)" : "0 0 16px rgba(255,255,255,0.18)",
+                        }}
+                      />
+                    ))}
+                  </div>
+                  <div style={{
+                    width: "min(420px, 100%)",
+                    height: 8,
+                    borderRadius: 999,
+                    overflow: "hidden",
+                    background: "rgba(255,255,255,0.08)",
+                    boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.08)",
+                  }}>
+                    <div style={{
+                      width: `${Math.max(6, waveLoadPct)}%`,
+                      height: "100%",
+                      borderRadius: 999,
+                      background: "linear-gradient(90deg, rgba(255,255,255,0.85), var(--theme-color))",
+                      boxShadow: "0 0 22px var(--theme-color-dim)",
+                      transition: "width 0.12s linear",
+                    }} />
+                  </div>
+                  <div style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    flexWrap: "wrap",
+                    justifyContent: "center",
+                    fontSize: 12,
+                    fontWeight: 800,
+                    letterSpacing: "0.08em",
+                    textTransform: "uppercase",
+                    color: "rgba(255,255,255,0.84)",
+                  }}>
+                    <span>{current ? `Loading track ${Math.round(waveLoadPct)}%` : "Waiting for track"}</span>
+                    {preloadingNextId && nextQueuedTrack && (
+                      <span style={{ color: "rgba(255,255,255,0.52)" }}>
+                        Next primed: {nextQueuedTrack.artistName}
+                      </span>
+                    )}
+                  </div>
+                </div>
               </div>
             )}
           </div>
@@ -1659,6 +1956,18 @@ export default function PlayerPage() {
               color: reactedWith === "DISLIKE" ? "#000" : "#fff",
               display: "flex", alignItems: "center", justifyContent: "center",
             }}><ThumbsDown size={20} /></span>
+            <span data-btn="autoplay" className="btn-3d" style={{
+              minWidth: 90, height: 48, borderRadius: 24,
+              padding: "0 14px",
+              background: autoPlayEnabled ? "var(--theme-color)" : "rgba(0,0,0,0.3)",
+              color: autoPlayEnabled ? "#000" : "#fff",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              gap: 8,
+              fontSize: 12,
+              fontWeight: 800,
+              letterSpacing: "0.08em",
+              textTransform: "uppercase",
+            }}><PlaySquare size={18} /> Auto</span>
           </div>
           <div style={{ width: 1, height: 32, background: "rgba(255,255,255,0.3)" }} />
           {/* Transport */}
@@ -1706,6 +2015,27 @@ export default function PlayerPage() {
       </div>{/* end main-player-wrap */}
     </div>{/* end player-bg */}
 
+    {/* ── WAVEFORM 2D HITBOX (accurate seek while 3D card is tilted) ── */}
+    <div
+      id="waveform-hitbox"
+      role="slider"
+      aria-label="Waveform seek"
+      aria-valuemin={0}
+      aria-valuemax={Math.max(1, Math.floor(duration || 0))}
+      aria-valuenow={Math.floor(currentTime || 0)}
+      onPointerDown={onWaveSeekPointerDown}
+      onPointerMove={onWaveSeekPointerMove}
+      onPointerUp={onWaveSeekPointerUp}
+      style={{
+        position: "fixed",
+        zIndex: 9000,
+        borderRadius: 16,
+        cursor: current && waveReady ? "pointer" : "default",
+        touchAction: "none",
+        pointerEvents: current && waveReady ? "auto" : "none",
+      }}
+    />
+
     {/* ── CONTROLS 2D HITBOX (tracks 3D visual position, outside all transforms) ── */}
     <div
       id="controls-hitbox"
@@ -1733,6 +2063,15 @@ export default function PlayerPage() {
           onMouseDown={() => document.querySelector('#controls-visual [data-btn="dislike"]')?.classList.add("pressed")}
           onMouseUp={() => document.querySelector('#controls-visual [data-btn="dislike"]')?.classList.remove("pressed")}
         ><span style={{ width: 48, height: 48, display: "block" }} /></button>
+        <button className="btn-wrap"
+          onClick={toggleAutoPlay}
+          aria-label={autoPlayEnabled ? "Disable autoplay" : "Enable autoplay"}
+          aria-pressed={autoPlayEnabled}
+          onMouseEnter={() => document.querySelector('#controls-visual [data-btn="autoplay"]')?.classList.add("hovered")}
+          onMouseLeave={() => document.querySelector('#controls-visual [data-btn="autoplay"]')?.classList.remove("hovered","pressed")}
+          onMouseDown={() => document.querySelector('#controls-visual [data-btn="autoplay"]')?.classList.add("pressed")}
+          onMouseUp={() => document.querySelector('#controls-visual [data-btn="autoplay"]')?.classList.remove("pressed")}
+        ><span style={{ width: 90, height: 48, display: "block" }} /></button>
       </div>
       <div style={{ width: 1, height: 32 }} />
       {/* Transport */}

@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { ThumbsUp, ThumbsDown, Flame, ArrowLeft, Music2, ListMusic } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { ThumbsUp, ThumbsDown, Flame, ArrowLeft, Music2, ListMusic, RotateCcw } from "lucide-react";
 import Link from "next/link";
 
 type FilterType = "ALL" | "LIKE" | "DISLIKE" | "FIRE";
@@ -21,11 +21,12 @@ export default function HistoryPage() {
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [filter, setFilter] = useState<FilterType>("ALL");
   const [loading, setLoading] = useState(true);
+  const [restoring, setRestoring] = useState(false);
 
-  useEffect(() => {
+  const loadItems = useCallback(() => {
     setLoading(true);
     const params = filter !== "ALL" ? `?filter=${filter}` : "";
-    fetch(`/api/history${params}`)
+    return fetch(`/api/history${params}`)
       .then((r) => r.json())
       .then((data: HistoryItem[]) => {
         setItems(data);
@@ -33,6 +34,20 @@ export default function HistoryPage() {
       })
       .catch(() => setLoading(false));
   }, [filter]);
+
+  useEffect(() => {
+    void loadItems();
+  }, [loadItems]);
+
+  const restorePlayed = async () => {
+    setRestoring(true);
+    try {
+      await fetch("/api/submissions/restore", { method: "POST" });
+      await loadItems();
+    } finally {
+      setRestoring(false);
+    }
+  };
 
   const filterButtons: { type: FilterType; label: string; icon: React.ReactNode; color: string }[] = [
     { type: "ALL", label: "All", icon: null, color: "#fff" },
@@ -94,6 +109,30 @@ export default function HistoryPage() {
         }}>
           {items.length} tracks
         </span>
+        <button
+          onClick={() => void restorePlayed()}
+          disabled={restoring}
+          style={{
+            marginLeft: "auto",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            borderRadius: 999,
+            border: "1px solid rgba(255,255,255,0.14)",
+            background: restoring ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.08)",
+            color: "#fff",
+            padding: "9px 14px",
+            fontSize: 12,
+            fontWeight: 700,
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+            cursor: restoring ? "default" : "pointer",
+            opacity: restoring ? 0.6 : 1,
+          }}
+        >
+          <RotateCcw size={14} />
+          {restoring ? "Restoring" : "Restore Played"}
+        </button>
       </div>
 
       {/* Filter tabs */}

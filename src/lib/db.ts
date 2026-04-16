@@ -350,6 +350,22 @@ export const db = {
 
       return rows[0] ? mapSubmission(rows[0]) : null;
     },
+
+    async restorePlayed() {
+      const rows = await query<{ count: string }>(
+        `
+          WITH restored AS (
+            UPDATE submissions
+            SET played_at = NULL
+            WHERE played_at IS NOT NULL
+            RETURNING id
+          )
+          SELECT COUNT(*)::text AS count FROM restored
+        `,
+      );
+
+      return Number(rows[0]?.count ?? 0);
+    },
   },
 
   reaction: {
