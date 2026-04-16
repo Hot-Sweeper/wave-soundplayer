@@ -1,0 +1,56 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  
+}
+
+model Submission {
+  id         String    @id @default(cuid())
+  artistName String    @map("artist_name") @db.VarChar(100)
+  artistNote String?   @map("artist_note") @db.VarChar(500)
+  audioPath  String    @map("audio_path")
+  audioExt   String    @map("audio_ext") @db.VarChar(10)
+  avatarPath String?   @map("avatar_path")
+  queuePos   Int       @map("queue_pos") @default(autoincrement())
+  playedAt   DateTime? @map("played_at")
+  expiresAt  DateTime  @map("expires_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  reactions  Reaction[]
+
+  @@index([playedAt])
+  @@index([expiresAt])
+  @@map("submissions")
+}
+
+model Reaction {
+  id           String     @id @default(cuid())
+  submissionId String     @map("submission_id")
+  type         ReactionType
+  createdAt    DateTime   @default(now()) @map("created_at")
+
+  submission   Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+
+  @@index([submissionId])
+  @@map("reactions")
+}
+
+model Setting {
+  key       String   @id @db.VarChar(100)
+  value     String
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("settings")
+}
+
+enum ReactionType {
+  LIKE
+  DISLIKE
+  FIRE
+}
+
+
